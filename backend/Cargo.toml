@@ -1,23 +1,62 @@
 [package]
 name = "hamr-app-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
+# Web 框架
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# 序列化
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
-jsonwebtoken = "9"
+
+# 数据库（SQLite）
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono"] }
+
+# UUID 和时间
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# 配置和错误处理
 dotenvy = "0.15"
 anyhow = "1.0"
 thiserror = "1.0"
+
+# Web3 DID 身份认证
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+multibase = "0.9"
+
+# P2P 网络
+libp2p = { version = "0.53", features = [
+    "tokio",
+    "tcp",
+    "quic",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "mdns",
+    "kad",
+    "identify",
+    "ping",
+] }
+
+# 加密
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+
+# CRDT 数据同步
+automerge = "0.5"
+
+# 其他
 axum-extra = { version = "0.9", features = ["typed-header"] }
 headers = "0.4"
+base64 = "0.22"
