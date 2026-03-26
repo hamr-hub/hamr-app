@@ -30,21 +30,22 @@ dotenvy = "0.15"
 anyhow = "1.0"
 thiserror = "1.0"
 
-# Web3 DID 身份认证
+# 系统目录（home_dir 等）
+dirs-next = "2.0"
+
+# Web3 DID 身份认证（ed25519-dalek v2）
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 multibase = "0.9"
 
-# P2P 网络
+# P2P 网络（libp2p 0.53）
 libp2p = { version = "0.53", features = [
     "tokio",
     "tcp",
-    "quic",
     "noise",
     "yamux",
     "gossipsub",
     "mdns",
-    "kad",
     "identify",
     "ping",
 ] }
@@ -52,9 +53,6 @@ libp2p = { version = "0.53", features = [
 # 加密
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
-
-# CRDT 数据同步
-automerge = "0.5"
 
 # 其他
 axum-extra = { version = "0.9", features = ["typed-header"] }

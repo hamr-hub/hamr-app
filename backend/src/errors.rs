@@ -16,10 +16,8 @@ pub enum AppError {
     ValidationError(String),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Internal error")]
+    #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
-    #[error("JWT error")]
-    JwtError(#[from] jsonwebtoken::errors::Error),
 }
 
 impl IntoResponse for AppError {
@@ -31,14 +29,19 @@ impl IntoResponse for AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             AppError::ValidationError(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             AppError::Database(e) => {
-                tracing::error!("DB: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+                tracing::error!("DB error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
             }
             AppError::Internal(e) => {
-                tracing::error!("Internal: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+                tracing::error!("Internal error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
             }
-            AppError::JwtError(_) => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
