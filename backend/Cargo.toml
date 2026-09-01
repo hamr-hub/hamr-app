@@ -8,7 +8,10 @@ edition = "2021"
 axum = { version = "0.7", features = ["macros"] }
 http = "1"
 tokio = { version = "1", features = ["full"] }
-tower = "0.4"
+# tower 0.5：axum 0.7 的 Router 实现 ServiceExt<oneshot>，测试用 onshot
+# 调用必须和 axum 同一个 major（之前写成 0.4 导致 `use tower::ServiceExt`
+# 找不到方法）
+tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # 序列化

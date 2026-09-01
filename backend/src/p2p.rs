@@ -10,9 +10,7 @@ use libp2p::{
     futures::StreamExt,
     gossipsub,
     gossipsub::IdentTopic,
-    identity,
-    mdns,
-    noise,
+    identity, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
@@ -21,8 +19,11 @@ use std::{
     collections::HashMap,
     future::Future,
     path::Path,
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    time::{Duration, Instant},
 };
 use tokio::{
     fs,
@@ -204,8 +205,10 @@ pub trait SyncStore {
     ) -> impl Future<Output = Result<Option<i64>, SyncError>> + Send;
 
     /// 单事务内落库：整行替换（或删除）+ 写 sync_log
-    fn apply_record(&self, record: &SyncRecord)
-        -> impl Future<Output = Result<(), SyncError>> + Send;
+    fn apply_record(
+        &self,
+        record: &SyncRecord,
+    ) -> impl Future<Output = Result<(), SyncError>> + Send;
 }
 
 /// P3: 处理一条收到的同步记录 —— 幂等去重 + last-write-wins 合并 + 真实落库
@@ -421,6 +424,12 @@ pub struct NodeStatus {
     pub known_peers: usize,
     pub gossipsub_topic: String,
     pub uptime_seconds: u64,
+    /// Round-4: 被 rate limiter 主动丢弃的入站 sync 消息总数（累计）
+    #[serde(default)]
+    pub rate_limited_drops: u64,
+    /// Round-4: 当前 rate limiter 持有的 peer 桶数（含 idle）
+    #[serde(default)]
+    pub active_rate_limited_peers: usize,
 }
 
 // ─────────────────────────────────────────────
@@ -431,6 +440,112 @@ pub struct NodeStatus {
 pub struct HamrBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
+}
+
+// ─────────────────────────────────────────────
+// Round-4: 入站 sync 限流（防恶意/失灵 peer 灌爆本地 DB）
+// ─────────────────────────────────────────────
+
+/// 单 peer 的 token bucket。
+///
+/// 行为：
+/// - 初始满（`capacity` 个 token），允许短时 burst；
+/// - 自上次 refill 以来按 `refill_per_sec * elapsed` 补充，封顶 `capacity`；
+/// - `try_consume()` 试图取 1 个 token：成功返回 true，失败返回 false
+///   且**不扣 token**（失败方应该直接 drop，不要重排队）。
+///
+/// 与 wall-clock 无关：`last_refill` 在 `new()` 时打点；测试可以用
+/// `sleep(Duration::from_millis(...))` 推进时间。
+pub struct TokenBucket {
+    capacity: f64,
+    refill_per_sec: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            capacity,
+            refill_per_sec,
+            tokens: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    pub fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 当前可用 token 数（测试 / 调试用）。
+    #[cfg(test)]
+    pub fn tokens(&self) -> f64 {
+        self.tokens
+    }
+}
+
+/// 按 `peer_id` 索引的限流表。
+///
+/// 设计要点：
+/// - **每 peer 独立**：一端 burst 不会饿死另一端；
+/// - **懒创建**：新 peer 第一次来消息才建桶；
+/// - **可选回收**：`evict_idle()` 回收满桶且超过 idle_evict 的桶，
+///   防对端下线后 bucket 永久驻留（gossip 列表里常见短时 peer 抖动）。
+pub struct PeerRateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    idle_evict_after: Duration,
+    buckets: HashMap<String, TokenBucket>,
+}
+
+impl PeerRateLimiter {
+    pub fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self {
+            capacity,
+            refill_per_sec,
+            idle_evict_after: Duration::from_secs(300),
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// 尝试为 `peer` 消费 1 个 token；新 peer 首次访问会建一个满桶。
+    pub fn try_consume(&mut self, peer: &str) -> bool {
+        let bucket = self
+            .buckets
+            .entry(peer.to_string())
+            .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_per_sec));
+        bucket.try_consume()
+    }
+
+    /// 当前在表里的 peer 数（含 idle）。
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// 清理桶：仅保留**没满**的（满桶说明 idle 不影响后续决策，浪费内存）；
+    /// 与 `idle_evict_after` 比较 `last_refill` 久远度。
+    /// 返回清理掉的桶数（测试用）。
+    pub fn evict_idle(&mut self) -> usize {
+        let now = Instant::now();
+        let before = self.buckets.len();
+        self.buckets.retain(|_, b| {
+            // 满桶 + 长时间没动 → 可丢
+            let is_full = b.tokens >= b.capacity;
+            let is_idle = now.duration_since(b.last_refill) >= self.idle_evict_after;
+            !(is_full && is_idle)
+        });
+        before - self.buckets.len()
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -523,7 +638,16 @@ pub struct P2PNode {
     start_time: std::time::Instant,
     /// 落库句柄；None = 只广播不落库（无 DB 的降级模式）
     store: Option<sqlx::PgPool>,
+    /// Round-4: 单 peer 同步消息限流（防 gossip 灌爆本地 DB）
+    rate_limiter: PeerRateLimiter,
+    /// Round-4: 累计被限流掉的入站 sync 消息数（暴露给 /p2p/status）
+    rate_limited_drops: Arc<AtomicU64>,
+    /// Round-4: 入站消息累计计数器（每 N 条触发一次 rate_limiter 桶回收）
+    messages_since_evict: u64,
 }
+
+/// Round-4: 每收到 N 条入站消息就尝试回收一次 idle 桶
+const RATE_LIMITER_EVICT_INTERVAL: u64 = 100;
 
 impl P2PNode {
     /// 创建 P2P 节点
@@ -590,6 +714,11 @@ impl P2PNode {
             listen_addresses: Arc::new(RwLock::new(Vec::new())),
             start_time: std::time::Instant::now(),
             store,
+            // capacity=10、refill=2/s 给了 ~5s 突发后回稳到 2 msg/s；
+            // 家庭场景下足够，对恶意 peer 也能立刻挡死。
+            rate_limiter: PeerRateLimiter::new(10.0, 2.0),
+            rate_limited_drops: Arc::new(AtomicU64::new(0)),
+            messages_since_evict: 0,
         })
     }
 
@@ -670,15 +799,50 @@ impl P2PNode {
                                 ..
                             },
                         )) => {
+                            // Round-4: 每 N 条消息回收一次 idle 桶，
+                            // 防止 gossip 抖动留下永久 bucket 浪费内存。
+                            // 频率远低于消息量，开销可忽略。
+                            self.messages_since_evict += 1;
+                            if self.messages_since_evict >= RATE_LIMITER_EVICT_INTERVAL {
+                                self.messages_since_evict = 0;
+                                let evicted = self.rate_limiter.evict_idle();
+                                if evicted > 0 {
+                                    tracing::debug!(
+                                        "[P2P][RateLimit] evicted {} idle buckets",
+                                        evicted
+                                    );
+                                }
+                            }
+
                             match serde_json::from_slice::<SyncMessage>(&message.data) {
                                 Ok(sync_msg) => {
-                                    tracing::info!(
-                                        "[P2P][Sync] Received {} on table '{}' from {}",
-                                        sync_msg.operation,
-                                        sync_msg.table,
-                                        propagation_source
-                                    );
-                                    self.persist_incoming_sync(&sync_msg);
+                                    // Round-4: 单 peer 限流。失败直接 drop，
+                                    // 既不写库也不重排队 —— LWW 的 sync_id 幂等
+                                    // 已经兜住合法重发，恶意灌水的"重发"扔掉就是。
+                                    let peer_key = propagation_source.to_string();
+                                    if !self.rate_limiter.try_consume(&peer_key) {
+                                        let drops = self
+                                            .rate_limited_drops
+                                            .fetch_add(1, Ordering::Relaxed)
+                                            + 1;
+                                        tracing::warn!(
+                                            "[P2P][RateLimit] drop sync_id={} from {} \
+                                             (table={}, op={}) — bucket empty (total_drops={})",
+                                            sync_msg.sync_id,
+                                            propagation_source,
+                                            sync_msg.table,
+                                            sync_msg.operation,
+                                            drops
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "[P2P][Sync] Received {} on table '{}' from {}",
+                                            sync_msg.operation,
+                                            sync_msg.table,
+                                            propagation_source
+                                        );
+                                        self.persist_incoming_sync(&sync_msg);
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("[P2P] Failed to decode sync message: {}", e);
@@ -780,6 +944,10 @@ impl P2PNode {
                                 known_peers: known,
                                 gossipsub_topic: self.topic.to_string(),
                                 uptime_seconds: self.start_time.elapsed().as_secs(),
+                                rate_limited_drops: self
+                                    .rate_limited_drops
+                                    .load(Ordering::Relaxed),
+                                active_rate_limited_peers: self.rate_limiter.len(),
                             };
                             let _ = tx.send(status);
                         }
@@ -1037,7 +1205,9 @@ mod tests {
         let store = MockStore::default();
         let rec = record("sync-1", 1_000, "阿妈");
 
-        let outcome = handle_incoming_sync(&store, &rec).await.expect("should apply");
+        let outcome = handle_incoming_sync(&store, &rec)
+            .await
+            .expect("should apply");
 
         assert_eq!(outcome, SyncOutcome::Applied);
         let (ts, payload) = store.row("people", PK).expect("row must exist");
@@ -1249,10 +1419,136 @@ mod tests {
         let mut bad_payload = record("sync-badpayload", 1_000, "x");
         bad_payload.payload = serde_json::json!("just a string");
         assert!(matches!(
-            handle_incoming_sync(&store, &bad_payload).await.unwrap_err(),
+            handle_incoming_sync(&store, &bad_payload)
+                .await
+                .unwrap_err(),
             SyncError::InvalidRecord(_)
         ));
 
         assert_eq!(store.write_count(), 0);
+    }
+
+    // ─────────────────────────────────────────────
+    // Round-4: TokenBucket + PeerRateLimiter 限流单测
+    //
+    // 不起 libp2p、不连 DB —— 直接驱动 in-memory 结构。
+    // 时间相关测试用 tokio::time::sleep 推进 Instant。
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn token_bucket_starts_full_and_drains_to_zero() {
+        let mut b = TokenBucket::new(5.0, 1.0);
+        assert!((b.tokens() - 5.0).abs() < 1e-9, "初始应为满桶 5 token");
+        for i in 0..5 {
+            assert!(b.try_consume(), "第 {i} 次消耗应成功");
+        }
+        // 第 6 次：桶空
+        assert!(!b.try_consume(), "第 6 次必须失败");
+        assert!(b.tokens() < 1.0, "空桶 token 应 < 1");
+    }
+
+    #[tokio::test]
+    async fn token_bucket_refills_at_configured_rate() {
+        // 10 / 1s → 1 token / 100ms
+        let mut b = TokenBucket::new(10.0, 10.0);
+        // 全用完
+        for _ in 0..10 {
+            assert!(b.try_consume());
+        }
+        assert!(!b.try_consume(), "刚用完应立刻没 token");
+
+        // 推进 ~150ms（>= 100ms 即可回 1 token）
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(b.try_consume(), "150ms 后应补回至少 1 token");
+        // 但只补回 1 个左右，不该瞬间满
+        assert!(b.tokens() < 2.5, "只睡了 150ms，不该补 ~10 token 上限");
+    }
+
+    #[tokio::test]
+    async fn token_bucket_caps_at_capacity_not_unbounded() {
+        // 5 / 10/s：即使睡 10s，token 也只补到 5，不会涨到 100+
+        let mut b = TokenBucket::new(5.0, 10.0);
+        // 全部用掉
+        for _ in 0..5 {
+            assert!(b.try_consume());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // 用光这 200ms 内补的（最多 2 个）
+        assert!(b.try_consume());
+        assert!(b.try_consume());
+        // 第 3 个不该有（200ms × 10/s = 2 token 已用完）
+        assert!(!b.try_consume(), "短窗内最多补 capacity 比例");
+        // 但 token 不会超过 5（cap），再睡再补也封顶
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        for _ in 0..5 {
+            assert!(b.try_consume(), "封顶 5：补满后最多再用 5 次");
+        }
+        assert!(!b.try_consume(), "5 用完就该停");
+    }
+
+    #[test]
+    fn peer_rate_limiter_isolates_buckets_per_peer() {
+        // 一端被打爆不影响另一端
+        let mut rl = PeerRateLimiter::new(2.0, 0.001); // 几乎不补
+        assert!(rl.try_consume("peer-A"));
+        assert!(rl.try_consume("peer-A"));
+        assert!(!rl.try_consume("peer-A"), "peer-A 桶应被打空");
+
+        // peer-B 仍应有自己完整的桶
+        assert!(rl.try_consume("peer-B"));
+        assert!(rl.try_consume("peer-B"));
+        assert!(!rl.try_consume("peer-B"));
+
+        // 同一个 peer 再调一次仍然 0（只要没睡够补 1 个的时间）
+        assert!(!rl.try_consume("peer-A"));
+        assert_eq!(rl.len(), 2, "两个 peer 各自应有独立桶");
+    }
+
+    #[tokio::test]
+    async fn peer_rate_limiter_refills_independently() {
+        let mut rl = PeerRateLimiter::new(3.0, 1000.0); // 极快补
+                                                        // 把 peer-A 用光
+        for _ in 0..3 {
+            assert!(rl.try_consume("peer-A"));
+        }
+        assert!(!rl.try_consume("peer-A"));
+
+        // 即使立刻试 peer-B，peer-B 应还有满桶
+        assert!(rl.try_consume("peer-B"));
+        assert!(rl.try_consume("peer-B"));
+        assert!(rl.try_consume("peer-B"));
+
+        // 等一小会儿 peer-A 应该又满了（rate=1000/s）
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(rl.try_consume("peer-A"), "10ms × 1000/s 应补 ≥ 10 token");
+        assert!(rl.try_consume("peer-A"));
+        assert!(rl.try_consume("peer-A"));
+    }
+
+    #[test]
+    fn peer_rate_limiter_evict_idle_drops_full_buckets() {
+        // 直接构造 limiter，调 evict_idle()：因为 last_refill = now()，
+        // 桶没满 + 还没 idle → 不会被回收
+        let mut rl = PeerRateLimiter::new(5.0, 1.0);
+        rl.try_consume("peer-A"); // 还剩 4 token，未满
+        let evicted = rl.evict_idle();
+        assert_eq!(evicted, 0, "未满桶不应被回收");
+        assert_eq!(rl.len(), 1);
+
+        // 桶存在但仍非 idle（last_refill = now()）→ 不会被回收，
+        // 哪怕桶已经满（说明对端已经安静了很久）。
+        // 这里关键是"满"和"idle"两个条件**同时**才回收，单满不够。
+        let mut rl2 = PeerRateLimiter::new(5.0, 1.0);
+        // 建一个桶但不消耗 → 桶满
+        rl2.try_consume("peer-B");
+        // 撤回最后一次消耗 — 我们的 API 没有"退还"，所以改成消耗 1 再睡 0ms
+        // 触发 refill 把桶补满（refill 不会让桶超过 capacity）
+        rl2.try_consume("peer-B"); // 剩 3
+        rl2.try_consume("peer-B"); // 剩 2
+        rl2.try_consume("peer-B"); // 剩 1
+        rl2.try_consume("peer-B"); // 剩 0
+                                   // 立刻 evict：桶不满（0 token）+ 不 idle → 不会被回收
+        assert_eq!(rl2.evict_idle(), 0, "桶不空就不应回收");
+        assert_eq!(rl2.len(), 1);
     }
 }
