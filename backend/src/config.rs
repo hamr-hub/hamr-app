@@ -1,4 +1,95 @@
-use anyhow::Context;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 清除所有相关 env 变量，避免测试间互相污染
+    fn clear_env() {
+        for k in [
+            "HAMR_DATA_DIR",
+            "HAMR_APP_AUTH_MODE",
+            "HAMR_APP_SHARED_SECRET",
+            "HAMR_APP_ALLOWED_ORIGINS",
+            "DATABASE_URL",
+            "PORT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn default_auth_mode_is_open() {
+        clear_env();
+        let cfg = Config::from_env().expect("default config");
+        assert_eq!(cfg.auth_mode, AuthMode::Open);
+        // 默认 CORS allowlist 至少包含前端默认端口
+        assert!(cfg.allowed_origins.iter().any(|o| o == "http://localhost:3010"));
+    }
+
+    #[test]
+    fn parses_did_auth_mode() {
+        clear_env();
+        std::env::set_var("HAMR_APP_AUTH_MODE", "did");
+        let cfg = Config::from_env().expect("did config");
+        assert_eq!(cfg.auth_mode, AuthMode::Did);
+    }
+
+    #[test]
+    fn parses_shared_secret_aliases() {
+        clear_env();
+        std::env::set_var("HAMR_APP_AUTH_MODE", "shared_secret");
+        std::env::set_var("HAMR_APP_SHARED_SECRET", "topsecret");
+        let cfg = Config::from_env().expect("shared-secret config");
+        assert_eq!(cfg.auth_mode, AuthMode::SharedSecret);
+        assert_eq!(cfg.shared_secret.as_deref(), Some("topsecret"));
+
+        clear_env();
+        std::env::set_var("HAMR_APP_AUTH_MODE", "shared-secret");
+        std::env::set_var("HAMR_APP_SHARED_SECRET", "topsecret");
+        let cfg = Config::from_env().expect("shared-secret config");
+        assert_eq!(cfg.auth_mode, AuthMode::SharedSecret);
+    }
+
+    #[test]
+    fn shared_secret_requires_value() {
+        clear_env();
+        std::env::set_var("HAMR_APP_AUTH_MODE", "shared-secret");
+        let err = Config::from_env().unwrap_err().to_string();
+        assert!(err.contains("HAMR_APP_SHARED_SECRET"), "msg was: {err}");
+    }
+
+    #[test]
+    fn invalid_auth_mode_bails() {
+        clear_env();
+        std::env::set_var("HAMR_APP_AUTH_MODE", "oauth");
+        let err = Config::from_env().unwrap_err().to_string();
+        assert!(err.contains("invalid HAMR_APP_AUTH_MODE"), "msg was: {err}");
+    }
+
+    #[test]
+    fn cors_origins_parses_and_trims() {
+        clear_env();
+        std::env::set_var(
+            "HAMR_APP_ALLOWED_ORIGINS",
+            "http://a.test, http://b.test ,,http://c.test",
+        );
+        let cfg = Config::from_env().expect("cors config");
+        assert_eq!(
+            cfg.allowed_origins,
+            vec![
+                "http://a.test".to_string(),
+                "http://b.test".to_string(),
+                "http://c.test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn defaults_database_url_to_postgres() {
+        clear_env();
+        let cfg = Config::from_env().expect("default config");
+        assert!(cfg.database_url.starts_with("postgresql://"), "got: {}", cfg.database_url);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AuthMode {
@@ -17,6 +108,8 @@ pub struct Config {
     pub data_dir: String,
     pub auth_mode: AuthMode,
     pub shared_secret: Option<String>,
+    /// CORS 允许的 Origin 列表（精确匹配）
+    pub allowed_origins: Vec<String>,
 }
 
 impl Config {
@@ -46,9 +139,27 @@ impl Config {
             anyhow::bail!("HAMR_APP_AUTH_MODE=shared-secret requires HAMR_APP_SHARED_SECRET");
         }
 
+        // CORS allowlist: 逗号分隔；为空时回退到安全的本地默认（开发端口）
+        let allowed_origins: Vec<String> = std::env::var("HAMR_APP_ALLOWED_ORIGINS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|o| o.trim().to_string())
+                    .filter(|o| !o.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "http://localhost:3010".to_string(),
+                    "http://localhost:3000".to_string(),
+                    "http://127.0.0.1:3010".to_string(),
+                    "http://127.0.0.1:3000".to_string(),
+                ]
+            });
+
         Ok(Self {
             database_url: std::env::var("DATABASE_URL")
-                .unwrap_or_else(|_| format!("sqlite://{}/hamr.db", data_dir)),
+                .unwrap_or_else(|_| "postgresql://hamr:changeme@localhost:5432/hamr_app".to_string()),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -56,6 +167,7 @@ impl Config {
             data_dir,
             auth_mode,
             shared_secret,
+            allowed_origins,
         })
     }
 }

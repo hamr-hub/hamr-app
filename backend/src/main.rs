@@ -10,8 +10,9 @@ mod routes;
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 pub use config::Config;
@@ -32,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let identity = DeviceIdentity::load_or_create(&identity_path).await?;
     tracing::info!("Device DID: {}", identity.did);
 
-    // ── 初始化 SQLite 数据库 ──────────────────────────────────
+    // ── 初始化 PostgreSQL 数据库 ───────────────────────────────
     let state = AppState::new(&config.database_url).await?;
     state.run_migrations().await?;
 
@@ -50,11 +51,33 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(state);
 
-    // ── CORS ──────────────────────────────────────────────────
+    // ── CORS（按 env allowlist 收紧，避免 Any 暴露） ──────────
+    // 仅允许 HAMR_APP_ALLOWED_ORIGINS 列出的 Origin；支持标准 GET/POST/PUT/DELETE/PATCH
+    // 与 Content-Type/Authorization/X-DID-* 自定义头。
+    let allowed_origins: Vec<http::HeaderValue> = state
+        .config
+        .allowed_origins
+        .iter()
+        .filter_map(|o| http::HeaderValue::from_str(o).ok())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::PATCH,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::HeaderName::from_static("x-did-public-key"),
+            http::HeaderName::from_static("x-did-signature"),
+            http::HeaderName::from_static("x-did-timestamp"),
+        ])
+        .max_age(std::time::Duration::from_secs(600));
 
     // ── HTTP 路由 ─────────────────────────────────────────────
     let app = routes::build_router((*state).clone())

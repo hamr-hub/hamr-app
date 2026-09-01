@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # Web 框架
 axum = { version = "0.7", features = ["macros"] }
+http = "1"
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
@@ -18,8 +19,8 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# 数据库（SQLite）
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "uuid", "chrono"] }
+# 数据库（PostgreSQL — 与 docker-compose.yml + migrations/*.sql 保持一致）
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }
 
 # UUID 和时间
 uuid = { version = "1.0", features = ["v4", "serde"] }
