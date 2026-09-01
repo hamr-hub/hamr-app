@@ -1,1 +1,13 @@
 .DS_Store
+
+# Rust 构建产物（backend/target 本地已 2GB+，绝不能进版本库）
+target/
+
+# 本地环境变量（含 HAMR_APP_SHARED_SECRET 等凭据）
+.env
+.env.local
+
+# 设备身份 / P2P 密钥（identity.json 内含 Ed25519 私钥）
+.hamr/
+identity
+identity.json

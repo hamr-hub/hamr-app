@@ -10,7 +10,6 @@ mod routes;
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -38,7 +37,9 @@ async fn main() -> anyhow::Result<()> {
     state.run_migrations().await?;
 
     // ── 启动 P2P 节点 ─────────────────────────────────────────
-    let state = match p2p::start_p2p_node(&config.data_dir).await {
+    // 把 DB 池交给节点：入站 SyncMessage 走 handle_incoming_sync 真实落库
+    // （sync_log 幂等去重 + last-write-wins 合并）
+    let state = match p2p::start_p2p_node(&config.data_dir, Some(state.db.clone())).await {
         Ok(handle) => {
             tracing::info!("P2P node started: peer_id={}", handle.peer_id);
             state.with_p2p(handle)

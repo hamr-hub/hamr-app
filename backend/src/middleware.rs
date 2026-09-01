@@ -40,7 +40,9 @@ impl Default for Claims {
 ///
 /// DID 模式请求格式：
 /// ```text
-/// canonical = "{device_did}:{timestamp}:{method}:{path}"
+/// canonical = "{device_did}:{timestamp}:{method}:{path_and_query}"
+///             path_and_query 含 query string，例如
+///             /api/v1/dashboard?family_id=... —— query 参与签名，不可篡改
 /// signature = ed25519_sign(sk, canonical)
 /// headers:
 ///   X-DID-Public-Key: <32-byte ed25519 public key, base64>
@@ -160,7 +162,13 @@ fn verify_did_signature(req: &Request) -> Result<Claims, AppError> {
     };
 
     let method = req.method().as_str();
-    let path = req.uri().path();
+    // 连 query 一起签：family_id 这类授权相关参数就在 query 里，只签 path
+    // 等于允许攻击者在签名依然有效的情况下改 query（换一家人的 family_id）。
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| req.uri().path());
     let canonical = format!("{}:{}:{}:{}", did, timestamp, method, path);
 
     let ok = DeviceIdentity::verify(&pk_bytes, canonical.as_bytes(), &sig_bytes)
@@ -174,8 +182,8 @@ fn verify_did_signature(req: &Request) -> Result<Claims, AppError> {
     }
 
     Ok(Claims {
-        sub: did,
-        device_id: did.clone(),
+        sub: did.clone(),
+        device_id: did,
         exp: timestamp + 3600,
     })
 }
@@ -183,6 +191,8 @@ fn verify_did_signature(req: &Request) -> Result<Claims, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // STANDARD.encode / .decode 是 Engine trait 上的方法，需入作用域
+    use base64::Engine as _;
 
     fn make_request(pk_b64: &str, ts: &str, sig_b64: &str) -> Request {
         let req = axum::http::Request::builder()

@@ -1,8 +1,14 @@
-use axum::{middleware, routing::get, Router};
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
 
 use crate::{
     db::AppState,
-    handlers::{dashboard, events, p2p as p2p_handler, people, spaces, tasks, things},
+    handlers::{
+        dashboard, events, p2p as p2p_handler, people, spaces, sync as sync_handler, tasks, things,
+    },
     middleware::auth_middleware,
 };
 
@@ -40,6 +46,8 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/spaces/:id",
             get(spaces::get).put(spaces::update).delete(spaces::delete),
         )
+        // P2P 入站同步：远程写入原语，必须在 auth_middleware 之后
+        .route("/api/v1/sync/incoming", post(sync_handler::incoming))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

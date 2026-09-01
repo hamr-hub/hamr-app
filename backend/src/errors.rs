@@ -48,3 +48,21 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+/// P2P 同步错误 → HTTP 语义
+///
+/// 数据/契约问题是调用方的错（422），落库失败是我们的错（500）。
+impl From<crate::p2p::SyncError> for AppError {
+    fn from(e: crate::p2p::SyncError) -> Self {
+        use crate::p2p::SyncError;
+        let msg = e.to_string();
+        match e {
+            // 表名不在白名单 / 记录本身不合法 —— 可预期的坏输入
+            SyncError::UnsupportedTable(_) | SyncError::InvalidRecord(_) => {
+                AppError::ValidationError(msg)
+            }
+            // 落库失败 —— 细节已在 p2p 层 error! 过，对外只报 500
+            SyncError::Store(_) => AppError::Internal(anyhow::anyhow!(msg)),
+        }
+    }
+}

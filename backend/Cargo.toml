@@ -20,7 +20,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 数据库（PostgreSQL — 与 docker-compose.yml + migrations/*.sql 保持一致）
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }
+# json: P2P sync 的 payload 以 jsonb 绑定进 jsonb_populate_record
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
 
 # UUID 和时间
 uuid = { version = "1.0", features = ["v4", "serde"] }
@@ -49,6 +50,8 @@ libp2p = { version = "0.53", features = [
     "mdns",
     "identify",
     "ping",
+    # macros: #[derive(NetworkBehaviour)] 所需（缺了 HamrBehaviour 无法编译）
+    "macros",
 ] }
 
 # 加密

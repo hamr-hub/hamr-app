@@ -2,6 +2,17 @@
 mod tests {
     use super::*;
 
+    /// env 是进程级共享状态，而 `cargo test` 默认多线程并发跑：
+    /// 一个测试的 `clear_env()` 会把邻居刚 `set_var` 的值抹掉（round-1 里
+    /// parses_did_auth_mode / cors_origins_parses_and_trims 就是这么 flaky 失败的）。
+    /// 所有碰 env 的测试统一先抢这把锁，串行执行。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 取 env 锁；某个测试 panic 导致锁中毒时仍要能继续（否则失败会级联）
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// 清除所有相关 env 变量，避免测试间互相污染
     fn clear_env() {
         for k in [
@@ -18,6 +29,7 @@ mod tests {
 
     #[test]
     fn default_auth_mode_is_open() {
+        let _env = env_guard();
         clear_env();
         let cfg = Config::from_env().expect("default config");
         assert_eq!(cfg.auth_mode, AuthMode::Open);
@@ -27,6 +39,7 @@ mod tests {
 
     #[test]
     fn parses_did_auth_mode() {
+        let _env = env_guard();
         clear_env();
         std::env::set_var("HAMR_APP_AUTH_MODE", "did");
         let cfg = Config::from_env().expect("did config");
@@ -35,6 +48,7 @@ mod tests {
 
     #[test]
     fn parses_shared_secret_aliases() {
+        let _env = env_guard();
         clear_env();
         std::env::set_var("HAMR_APP_AUTH_MODE", "shared_secret");
         std::env::set_var("HAMR_APP_SHARED_SECRET", "topsecret");
@@ -51,6 +65,7 @@ mod tests {
 
     #[test]
     fn shared_secret_requires_value() {
+        let _env = env_guard();
         clear_env();
         std::env::set_var("HAMR_APP_AUTH_MODE", "shared-secret");
         let err = Config::from_env().unwrap_err().to_string();
@@ -59,6 +74,7 @@ mod tests {
 
     #[test]
     fn invalid_auth_mode_bails() {
+        let _env = env_guard();
         clear_env();
         std::env::set_var("HAMR_APP_AUTH_MODE", "oauth");
         let err = Config::from_env().unwrap_err().to_string();
@@ -67,6 +83,7 @@ mod tests {
 
     #[test]
     fn cors_origins_parses_and_trims() {
+        let _env = env_guard();
         clear_env();
         std::env::set_var(
             "HAMR_APP_ALLOWED_ORIGINS",
@@ -85,6 +102,7 @@ mod tests {
 
     #[test]
     fn defaults_database_url_to_postgres() {
+        let _env = env_guard();
         clear_env();
         let cfg = Config::from_env().expect("default config");
         assert!(cfg.database_url.starts_with("postgresql://"), "got: {}", cfg.database_url);
@@ -110,6 +128,24 @@ pub struct Config {
     pub shared_secret: Option<String>,
     /// CORS 允许的 Origin 列表（精确匹配）
     pub allowed_origins: Vec<String>,
+}
+
+/// 手写 Debug：`shared_secret` 是凭据，绝不能因为一句 `{:?}` / `unwrap_err()`
+/// 就被打进日志，这里只暴露"有没有配"。
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &self.database_url)
+            .field("port", &self.port)
+            .field("data_dir", &self.data_dir)
+            .field("auth_mode", &self.auth_mode)
+            .field(
+                "shared_secret",
+                &self.shared_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("allowed_origins", &self.allowed_origins)
+            .finish()
+    }
 }
 
 impl Config {
