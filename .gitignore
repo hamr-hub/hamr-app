@@ -1,8 +1,8 @@
 .DS_Store
-
-# === Optimized Gitignore Additions ===
 .AppleDouble
 .LSOverride
+
+# === Editor / OS ===
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
@@ -15,6 +15,8 @@
 *.log
 *.tmp
 *.bak
+
+# === Node / 前端产物 ===
 node_modules/
 dist/
 dist-ssr/
@@ -27,8 +29,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# === Rust 构建产物（backend/target 本地已 2GB+，绝不进版本库）===
 /target/
+target/
 **/*.rs.bk
+
+# === 凭据 / 本地环境变量 ===
 .env
 .env.local
 .env.development.local
@@ -36,8 +43,11 @@ pnpm-debug.log*
 .env.production.local
 .env.*.local
 
+# === 设备身份 / P2P 私钥（identity.json 内含 Ed25519 私钥）===
+.hamr/
+identity
+identity.json
+
 # Antigravity CLI and Scratch
 .gemini/
 scratch/
-
-# Updated by Antigravity on 2026-09-02

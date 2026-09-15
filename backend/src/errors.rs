@@ -16,10 +16,8 @@ pub enum AppError {
     ValidationError(String),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Internal error")]
+    #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
-    #[error("JWT error")]
-    JwtError(#[from] jsonwebtoken::errors::Error),
 }
 
 impl IntoResponse for AppError {
@@ -31,17 +29,40 @@ impl IntoResponse for AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             AppError::ValidationError(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             AppError::Database(e) => {
-                tracing::error!("DB: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+                tracing::error!("DB error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
             }
             AppError::Internal(e) => {
-                tracing::error!("Internal: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+                tracing::error!("Internal error: {e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
             }
-            AppError::JwtError(_) => (StatusCode::UNAUTHORIZED, "Invalid token".to_string()),
         };
         (status, Json(json!({ "error": msg }))).into_response()
     }
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+/// P2P 同步错误 → HTTP 语义
+///
+/// 数据/契约问题是调用方的错（422），落库失败是我们的错（500）。
+impl From<crate::p2p::SyncError> for AppError {
+    fn from(e: crate::p2p::SyncError) -> Self {
+        use crate::p2p::SyncError;
+        let msg = e.to_string();
+        match e {
+            // 表名不在白名单 / 记录本身不合法 —— 可预期的坏输入
+            SyncError::UnsupportedTable(_) | SyncError::InvalidRecord(_) => {
+                AppError::ValidationError(msg)
+            }
+            // 落库失败 —— 细节已在 p2p 层 error! 过，对外只报 500
+            SyncError::Store(_) => AppError::Internal(anyhow::anyhow!(msg)),
+        }
+    }
+}
