@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use crate::metrics::AppMetrics;
 use crate::{p2p::P2PHandle, Config};
 
 #[derive(Clone)]
@@ -13,6 +16,9 @@ pub struct AppState {
     pub config: Config,
     /// P2P 节点句柄（可选，节点未启动时为 None）
     pub p2p_handle: Option<P2PHandle>,
+    /// Round-5：进程级 Prometheus 指标集合。P2P 事件循环单向写，`/metrics`
+    /// handler 只读原子量、不走 channel，节点卡死时抓取端仍能出数。
+    pub metrics: Arc<AppMetrics>,
 }
 
 impl AppState {
@@ -26,6 +32,7 @@ impl AppState {
             db,
             config,
             p2p_handle: None,
+            metrics: Arc::new(AppMetrics::new()),
         })
     }
 
@@ -37,6 +44,12 @@ impl AppState {
     /// 注入 P2P 节点句柄
     pub fn with_p2p(mut self, handle: P2PHandle) -> Self {
         self.p2p_handle = Some(handle);
+        self
+    }
+
+    /// 注入与 P2P 节点共享的指标句柄（main 里先建 Arc 再分别交给节点和 state）
+    pub fn with_metrics(mut self, metrics: Arc<AppMetrics>) -> Self {
+        self.metrics = metrics;
         self
     }
 }

@@ -1,5 +1,8 @@
 use axum::{
+    extract::State,
+    http::header::CONTENT_TYPE,
     middleware,
+    response::IntoResponse,
     routing::{get, post},
     Router,
 };
@@ -11,6 +14,17 @@ use crate::{
     },
     middleware::auth_middleware,
 };
+
+/// Round-5: Prometheus 抓取端点。
+///
+/// 公开（不走 auth / 限流）：抓取端通常是内网 Prometheus，家庭 P2P 拓扑里也没有
+/// 登录用户；指标只含聚合计数，不含 PII。内容类型必须是 Prometheus text format。
+async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render_prometheus(),
+    )
+}
 
 pub fn build_router(state: AppState) -> Router {
     // P2P 状态查询：peer_id / 监听地址 / mDNS 发现列表都是网络元数据，
@@ -61,6 +75,8 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/v1/health", get(health))
+        // 与 /health 同级公开，路径采用 Prometheus 社区惯例 `/metrics`
+        .route("/metrics", get(prometheus_metrics))
         .merge(p2p_routes)
         .merge(data_routes)
         .with_state(state)
@@ -109,6 +125,7 @@ mod tests {
             db,
             config,
             p2p_handle: None,
+            metrics: std::sync::Arc::new(crate::metrics::AppMetrics::new()),
         }
     }
 
@@ -155,6 +172,36 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// /metrics 公开可抓、返回 Prometheus text format，且含关键指标族。
+    /// 反向钉住 round-5 接线：metrics 必须是不需 Bearer token 的抓取端点。
+    #[tokio::test]
+    async fn metrics_endpoint_is_public_prometheus_text() {
+        let app = build_router(test_state("s3cret"));
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/plain") && ct.contains("version=0.0.4")),
+            "content-type must be Prometheus text exposition format, got {:?}",
+            resp.headers().get("content-type")
+        );
+
+        let body = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        // HELP/TYPE 头 + 三个核心指标族必须在
+        assert!(text.contains("# TYPE hamr_p2p_node_up gauge"));
+        assert!(text.contains("hamr_p2p_uptime_seconds "));
+        assert!(text.contains("# TYPE hamr_p2p_sync_total counter"));
     }
 
     /// /api/v1/health 仍然公开 —— 反向证明只有 p2p/业务路由套了 auth。

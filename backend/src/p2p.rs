@@ -30,6 +30,8 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+use crate::metrics::{AppMetrics, P2PHealthMonitor};
+
 // ─────────────────────────────────────────────
 // 数据结构
 // ─────────────────────────────────────────────
@@ -644,6 +646,10 @@ pub struct P2PNode {
     rate_limited_drops: Arc<AtomicU64>,
     /// Round-4: 入站消息累计计数器（每 N 条触发一次 rate_limiter 桶回收）
     messages_since_evict: u64,
+    /// Round-5: Prometheus 指标写入口（与 HTTP `/metrics` handler 共享同一 Arc）
+    metrics: Arc<AppMetrics>,
+    /// Round-5: 丢弃速率 / 被限流 peer 数的阈值告警判定（内部维护滑窗状态）
+    health_monitor: P2PHealthMonitor,
 }
 
 /// Round-4: 每收到 N 条入站消息就尝试回收一次 idle 桶
@@ -654,7 +660,11 @@ impl P2PNode {
     ///
     /// `data_dir`：身份文件存储目录（如 `~/.hamr`）
     /// `store`   ：收到同步消息后落库用的连接池；传 None 则只记日志不写
-    pub async fn new(data_dir: &str, store: Option<sqlx::PgPool>) -> Result<Self> {
+    pub async fn new(
+        data_dir: &str,
+        store: Option<sqlx::PgPool>,
+        metrics: Arc<AppMetrics>,
+    ) -> Result<Self> {
         let keypair = load_or_create_keypair(data_dir).await?;
         let peer_id = PeerId::from(keypair.public());
 
@@ -719,6 +729,8 @@ impl P2PNode {
             rate_limiter: PeerRateLimiter::new(10.0, 2.0),
             rate_limited_drops: Arc::new(AtomicU64::new(0)),
             messages_since_evict: 0,
+            metrics,
+            health_monitor: P2PHealthMonitor::new(),
         })
     }
 
@@ -799,6 +811,8 @@ impl P2PNode {
                                 ..
                             },
                         )) => {
+                            // Round-5: 入站消息总数（限流/解码之前计数）
+                            self.metrics.inc_messages_received();
                             // Round-4: 每 N 条消息回收一次 idle 桶，
                             // 防止 gossip 抖动留下永久 bucket 浪费内存。
                             // 频率远低于消息量，开销可忽略。
@@ -825,6 +839,18 @@ impl P2PNode {
                                             .rate_limited_drops
                                             .fetch_add(1, Ordering::Relaxed)
                                             + 1;
+                                        // Round-5: Prometheus 丢弃计数 + 滑窗阈值告警
+                                        let counted = self.metrics.inc_rate_limited_drops();
+                                        self.metrics
+                                            .set_rate_limiter_buckets(self.rate_limiter.len());
+                                        for alert in self.health_monitor.evaluate(
+                                            Instant::now(),
+                                            counted,
+                                            self.rate_limiter.len() as u64,
+                                        ) {
+                                            self.metrics.inc_health_alerts(1);
+                                            tracing::error!("[P2P][Health] {}", alert.message());
+                                        }
                                         tracing::warn!(
                                             "[P2P][RateLimit] drop sync_id={} from {} \
                                              (table={}, op={}) — bucket empty (total_drops={})",
@@ -845,6 +871,8 @@ impl P2PNode {
                                     }
                                 }
                                 Err(e) => {
+                                    // Round-5: 解码失败计数
+                                    self.metrics.inc_decode_errors();
                                     tracing::warn!("[P2P] Failed to decode sync message: {}", e);
                                 }
                             }
@@ -860,6 +888,11 @@ impl P2PNode {
                                 .behaviour_mut()
                                 .gossipsub
                                 .add_explicit_peer(&peer_id);
+                            // Round-5: 连接后刷新 peer gauge
+                            if let Ok(peers) = self.peers.read() {
+                                let connected = peers.values().filter(|p| p.connected).count();
+                                self.metrics.set_peer_gauges(connected, peers.len());
+                            }
                         }
 
                         // P2: 连接断开
@@ -869,6 +902,8 @@ impl P2PNode {
                                 if let Some(p) = peers.get_mut(&peer_id.to_string()) {
                                     p.connected = false;
                                 }
+                                let connected = peers.values().filter(|p| p.connected).count();
+                                self.metrics.set_peer_gauges(connected, peers.len());
                             }
                         }
 
@@ -893,15 +928,21 @@ impl P2PNode {
                                 .gossipsub
                                 .publish(self.topic.clone(), data)
                             {
-                                Ok(_) => tracing::debug!(
-                                    "[P2P][Sync] Published {} on '{}' (id={})",
-                                    msg.operation, msg.table, msg.sync_id
-                                ),
+                                Ok(_) => {
+                                    // Round-5: 向外广播成功计数
+                                    self.metrics.inc_publish(true);
+                                    tracing::debug!(
+                                        "[P2P][Sync] Published {} on '{}' (id={})",
+                                        msg.operation, msg.table, msg.sync_id
+                                    )
+                                }
                                 Err(gossipsub::PublishError::InsufficientPeers) => {
-                                    // 没有在线 peer 时静默处理（单设备模式正常）
+                                    // 没有在线 peer 时静默处理（单设备模式正常），不计错误
                                     tracing::debug!("[P2P][Sync] No peers to publish to");
                                 }
                                 Err(e) => {
+                                    // Round-5: 广播失败计数（不含 InsufficientPeers）
+                                    self.metrics.inc_publish(false);
                                     tracing::warn!("[P2P][Sync] Publish error: {}", e);
                                 }
                             }
@@ -1004,8 +1045,12 @@ impl P2PNode {
             return;
         };
         let record = SyncRecord::from(msg);
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
-            match handle_incoming_sync(&db, &record).await {
+            let result = handle_incoming_sync(&db, &record).await;
+            // Round-5: 把 LWW 结果折进 sync_total{result=applied|skipped|error}
+            metrics.record_sync_outcome(&result);
+            match result {
                 Ok(outcome) => tracing::debug!(
                     "[P2P][LWW] sync_id={} -> {}",
                     record.sync_id,
@@ -1065,8 +1110,12 @@ impl P2PHandle {
 ///
 /// `store`：收到对端同步消息后落库用的连接池（`AppState.db` 的克隆）。传 None
 /// 时节点仍能发现设备与广播，但入站同步只记日志不写库。
-pub async fn start_p2p_node(data_dir: &str, store: Option<sqlx::PgPool>) -> Result<P2PHandle> {
-    let node = P2PNode::new(data_dir, store).await?;
+pub async fn start_p2p_node(
+    data_dir: &str,
+    store: Option<sqlx::PgPool>,
+    metrics: Arc<AppMetrics>,
+) -> Result<P2PHandle> {
+    let node = P2PNode::new(data_dir, store, metrics).await?;
     let peer_id = node.peer_id.to_string();
 
     let (sync_tx, sync_rx) = mpsc::channel::<SyncMessage>(256);

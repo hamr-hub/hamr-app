@@ -3,6 +3,7 @@ mod db;
 mod did;
 mod errors;
 mod handlers;
+mod metrics;
 mod middleware;
 mod models;
 mod p2p;
@@ -36,17 +37,28 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(&config.database_url).await?;
     state.run_migrations().await?;
 
+    // ── 进程级指标集合（P2P 事件循环写、/metrics handler 读，同一 Arc） ──
+    let metrics = Arc::new(metrics::AppMetrics::new());
+
     // ── 启动 P2P 节点 ─────────────────────────────────────────
     // 把 DB 池交给节点：入站 SyncMessage 走 handle_incoming_sync 真实落库
     // （sync_log 幂等去重 + last-write-wins 合并）
-    let state = match p2p::start_p2p_node(&config.data_dir, Some(state.db.clone())).await {
+    let state = match p2p::start_p2p_node(
+        &config.data_dir,
+        Some(state.db.clone()),
+        metrics.clone(),
+    )
+    .await
+    {
         Ok(handle) => {
             tracing::info!("P2P node started: peer_id={}", handle.peer_id);
-            state.with_p2p(handle)
+            // 节点成功启动：node_up=1。单设备模式保持 0。
+            metrics.set_node_up(true);
+            state.with_p2p(handle).with_metrics(metrics)
         }
         Err(e) => {
             tracing::warn!("P2P node failed to start (single-device mode): {}", e);
-            state
+            state.with_metrics(metrics)
         }
     };
 
