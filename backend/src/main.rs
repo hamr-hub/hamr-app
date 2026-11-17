@@ -1,3 +1,4 @@
+mod agent;
 mod config;
 mod db;
 mod did;
@@ -39,6 +40,12 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 进程级指标集合（P2P 事件循环写、/metrics handler 读，同一 Arc） ──
     let metrics = Arc::new(metrics::AppMetrics::new());
+
+    // ── Agent 运行时（管家的大脑层）───────────────────────────
+    // 默认不启用（HAMR_AGENT_ENABLED）。启用但初始化失败时降级为「不可用」，
+    // 而不是让整个服务起不来 —— 其余五维数据功能不该被 Agent 拖垮。
+    let agent = build_agent(&config, &state.db).await;
+    let state = state.with_agent(agent);
 
     // ── 启动 P2P 节点 ─────────────────────────────────────────
     // 把 DB 池交给节点：入站 SyncMessage 走 handle_incoming_sync 真实落库
@@ -107,4 +114,32 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
 
     Ok(())
+}
+
+/// 构建 Agent 运行时。
+///
+/// 返回 None 表示 Agent 不可用（未启用 / 配置非法 / provider 构造失败）。
+/// 三种情况都只影响 Agent 相关端点（返回 503），不影响其余功能。
+async fn build_agent(config: &Config, db: &sqlx::PgPool) -> Option<Arc<agent::AgentRuntime>> {
+    if !config.agent.enabled {
+        tracing::info!("Agent runtime disabled (set HAMR_AGENT_ENABLED=true to enable)");
+        return None;
+    }
+
+    let provider = match agent::provider::OpenAiCompatProvider::new(&config.agent) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            tracing::warn!("Agent provider init failed, agent disabled: {}", e);
+            return None;
+        }
+    };
+
+    let store = Arc::new(agent::PgStore::new(db.clone()));
+    let runtime = agent::AgentRuntime::new(config.agent.clone(), provider, store, db.clone());
+    tracing::info!(
+        "Agent runtime ready: provider={} model={}",
+        config.agent.provider.as_str(),
+        config.agent.model
+    );
+    Some(Arc::new(runtime))
 }

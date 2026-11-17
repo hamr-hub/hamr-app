@@ -214,7 +214,7 @@ pub struct UpdateSpaceRequest {
 }
 
 // ===== Dashboard =====
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, FromRow)]
 pub struct DashboardStats {
     pub family_id: Uuid,
     pub people_count: i64,
@@ -240,4 +240,26 @@ impl Pagination {
     pub fn limit(&self) -> i64 {
         self.limit.unwrap_or(20).min(100).max(1)
     }
+}
+
+// ===== Agent 运行时 =====
+
+/// Agent 会话
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AgentSession {
+    pub id: Uuid,
+    pub family_id: Uuid,
+    pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Agent 长期记忆
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AgentMemory {
+    pub id: Uuid,
+    pub family_id: Uuid,
+    pub content: String,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
 }

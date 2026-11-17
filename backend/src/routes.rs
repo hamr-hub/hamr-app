@@ -10,7 +10,8 @@ use axum::{
 use crate::{
     db::AppState,
     handlers::{
-        dashboard, events, p2p as p2p_handler, people, spaces, sync as sync_handler, tasks, things,
+        agent, dashboard, events, p2p as p2p_handler, people, spaces, sync as sync_handler, tasks,
+        things,
     },
     middleware::auth_middleware,
 };
@@ -73,12 +74,36 @@ pub fn build_router(state: AppState) -> Router {
             auth_middleware,
         ));
 
+    // Agent 运行时路由：管家对话 + 会话/记忆管理。
+    //
+    // 与业务数据路由同级鉴权 —— Agent 能读到的家庭数据不比直接调 API 少，
+    // 鉴权级别必须一致。Agent 未启用时 handler 返回 503。
+    let agent_routes = Router::new()
+        .route("/api/v1/agent/chat", post(agent::chat))
+        .route("/api/v1/agent/status", get(agent::status))
+        .route("/api/v1/agent/sessions", get(agent::list_sessions))
+        .route(
+            "/api/v1/agent/sessions/:id/messages",
+            get(agent::session_messages),
+        )
+        .route(
+            "/api/v1/agent/sessions/:id",
+            axum::routing::delete(agent::delete_session),
+        )
+        .route("/api/v1/agent/memories", get(agent::list_memories))
+        .route("/api/v1/agent/memories", post(agent::add_memory))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
     Router::new()
         .route("/api/v1/health", get(health))
         // 与 /health 同级公开，路径采用 Prometheus 社区惯例 `/metrics`
         .route("/metrics", get(prometheus_metrics))
         .merge(p2p_routes)
         .merge(data_routes)
+        .merge(agent_routes)
         .with_state(state)
 }
 
@@ -120,12 +145,14 @@ mod tests {
             auth_mode: AuthMode::SharedSecret,
             shared_secret: Some(secret.to_string()),
             allowed_origins: vec!["http://localhost:3010".to_string()],
+            agent: crate::agent::AgentConfig::disabled(),
         };
         AppState {
             db,
             config,
             p2p_handle: None,
             metrics: std::sync::Arc::new(crate::metrics::AppMetrics::new()),
+            agent: None,
         }
     }
 
@@ -215,5 +242,61 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Agent 对话端点必须鉴权 —— 它能读到的家庭数据不比直接调 API 少。
+    #[tokio::test]
+    async fn agent_chat_requires_auth() {
+        let app = build_router(test_state("s3cret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/agent/chat")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"family_id":"00000000-0000-0000-0000-000000000001","message":"hi"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Agent 端点无 token 必须 401"
+        );
+    }
+
+    /// Agent 未启用时返回 503，而不是伪装成「助手不可用」的 500。
+    #[tokio::test]
+    async fn agent_chat_returns_503_when_disabled() {
+        let app = build_router(test_state("s3cret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/agent/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer s3cret")
+            .body(Body::from(
+                r#"{"family_id":"00000000-0000-0000-0000-000000000001","message":"hi"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Agent 未启用应返回 503"
+        );
+    }
+
+    /// Agent 的会话 / 记忆端点同样在鉴权之后。
+    #[tokio::test]
+    async fn agent_sessions_requires_auth() {
+        let app = build_router(test_state("s3cret"));
+
+        let req = Request::builder()
+            .uri("/api/v1/agent/sessions?family_id=00000000-0000-0000-0000-000000000001")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

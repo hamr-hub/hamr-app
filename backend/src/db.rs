@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use crate::agent::{AgentRuntime, ConversationStore};
 use crate::metrics::AppMetrics;
 use crate::{p2p::P2PHandle, Config};
 
@@ -19,6 +20,9 @@ pub struct AppState {
     /// Round-5：进程级 Prometheus 指标集合。P2P 事件循环单向写，`/metrics`
     /// handler 只读原子量、不走 channel，节点卡死时抓取端仍能出数。
     pub metrics: Arc<AppMetrics>,
+    /// Agent 运行时（可选）。未启用 `HAMR_AGENT_ENABLED` 时为 None，
+    /// Agent 相关端点统一返回 503。
+    pub agent: Option<Arc<AgentRuntime>>,
 }
 
 impl AppState {
@@ -33,6 +37,7 @@ impl AppState {
             config,
             p2p_handle: None,
             metrics: Arc::new(AppMetrics::new()),
+            agent: None,
         })
     }
 
@@ -51,5 +56,16 @@ impl AppState {
     pub fn with_metrics(mut self, metrics: Arc<AppMetrics>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// 注入 Agent 运行时
+    pub fn with_agent(mut self, agent: Option<Arc<AgentRuntime>>) -> Self {
+        self.agent = agent;
+        self
+    }
+
+    /// 取 Agent 的存储句柄（会话 / 记忆管理端点用）。
+    pub fn agent_store(&self) -> Option<Arc<dyn ConversationStore>> {
+        self.agent.as_ref().map(|a| a.store())
     }
 }

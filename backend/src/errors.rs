@@ -14,6 +14,9 @@ pub enum AppError {
     Conflict(String),
     #[error("Validation error: {0}")]
     ValidationError(String),
+    /// Agent 运行时不可用（未启用 / 模型调用失败）。
+    #[error("Agent unavailable: {0}")]
+    AgentUnavailable(String),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Internal error: {0}")]
@@ -28,6 +31,7 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             AppError::ValidationError(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
+            AppError::AgentUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
             AppError::Database(e) => {
                 tracing::error!("DB error: {e}");
                 (

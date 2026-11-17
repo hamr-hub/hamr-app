@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod dashboard;
 pub mod events;
 pub mod p2p;

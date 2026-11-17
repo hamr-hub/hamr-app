@@ -22,6 +22,15 @@ mod tests {
             "HAMR_APP_ALLOWED_ORIGINS",
             "DATABASE_URL",
             "PORT",
+            // Agent 配置也会被 Config::from_env 读取，一并清掉，
+            // 避免与 agent::config 的测试互相串扰。
+            "HAMR_AGENT_ENABLED",
+            "HAMR_AGENT_PROVIDER",
+            "HAMR_AGENT_BASE_URL",
+            "HAMR_AGENT_MODEL",
+            "HAMR_AGENT_API_KEY",
+            "HAMR_AGENT_ALLOW_PII",
+            "HAMR_JIABU_URL",
         ] {
             std::env::remove_var(k);
         }
@@ -128,6 +137,8 @@ pub struct Config {
     pub shared_secret: Option<String>,
     /// CORS 允许的 Origin 列表（精确匹配）
     pub allowed_origins: Vec<String>,
+    /// Agent 运行时配置（默认未启用）
+    pub agent: crate::agent::AgentConfig,
 }
 
 /// 手写 Debug：`shared_secret` 是凭据，绝不能因为一句 `{:?}` / `unwrap_err()`
@@ -144,6 +155,7 @@ impl std::fmt::Debug for Config {
                 &self.shared_secret.as_ref().map(|_| "<redacted>"),
             )
             .field("allowed_origins", &self.allowed_origins)
+            .field("agent", &self.agent)
             .finish()
     }
 }
@@ -204,6 +216,12 @@ impl Config {
             auth_mode,
             shared_secret,
             allowed_origins,
+            // Agent 配置单独解析：解析失败不应该让整个服务起不来，
+            // 主程序会把 Agent 降级为「不可用」，其余功能照常。
+            agent: crate::agent::AgentConfig::from_env().unwrap_or_else(|e| {
+                tracing::warn!("Agent config invalid, agent will be disabled: {e}");
+                crate::agent::AgentConfig::disabled()
+            }),
         })
     }
 }
