@@ -35,6 +35,12 @@ pub struct ToolContext {
     pub http: reqwest::Client,
     /// 模型来源 —— 本地不做脱敏。
     pub provider: ProviderKind,
+    /// 当前对话的家庭成员（None = 家庭公共视角）。
+    pub member_id: Option<Uuid>,
+    /// 技能包根目录。
+    pub skills_dir: std::path::PathBuf,
+    /// 是否允许发起写操作**提议**（默认关闭）。
+    pub allow_write: bool,
 }
 
 impl ToolContext {
@@ -52,10 +58,46 @@ struct ToolArgs {
     category: Option<String>,
     content: Option<String>,
     kind: Option<String>,
+    query: Option<String>,
+    entity_type: Option<String>,
+    key_or_title: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    due_date: Option<String>,
+    priority: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    location: Option<String>,
+    skill_id: Option<String>,
 }
 
-/// 构造工具列表。`jiabu_enabled` 决定是否暴露幸福指数工具。
-pub fn tool_specs(jiabu_enabled: bool) -> Vec<ToolSpec> {
+/// 所有工具名。
+///
+/// 场景包（技能包）的 `tools` 白名单只能引用这些名字 —— 白名单里出现
+/// 未知工具名时，技能包会被拒绝安装。写错了名字的技能包在运行时不会
+/// 报错（白名单只是收敛项），但它会静默地什么都做不了，所以要在安装
+/// 阶段就拦下来。
+pub const KNOWN_TOOLS: &[&str] = &[
+    "list_people",
+    "list_events",
+    "list_tasks",
+    "list_things",
+    "list_spaces",
+    "get_dashboard",
+    "remember",
+    "jiabu_score",
+    "search_wiki",
+    "wiki_page",
+    "use_skill",
+    "propose_task",
+    "propose_event",
+];
+
+/// 构造工具列表。
+///
+/// - `jiabu_enabled` 决定是否暴露幸福指数工具；
+/// - `allow_write` 决定是否暴露写操作**提议**工具（默认关闭）。
+pub fn tool_specs(jiabu_enabled: bool, allow_write: bool) -> Vec<ToolSpec> {
     let mut specs = vec![
         ToolSpec {
             spec_type: "function".to_string(),
@@ -157,6 +199,64 @@ pub fn tool_specs(jiabu_enabled: bool) -> Vec<ToolSpec> {
         },
     ];
 
+    // 家庭 Wiki：知识层只读工具，任何时候都可用。
+    specs.push(ToolSpec {
+        spec_type: "function".to_string(),
+        function: super::provider::FunctionDef {
+            name: "search_wiki".to_string(),
+            description: "检索家庭知识库（Wiki）。Wiki 是家庭成员、物品、空间、日程、待办的结构化汇总，回答「家里有哪些人/东西/房间」这类问题前先查它，比逐个列表工具更省事。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索关键词，如「牛奶」「妈妈」「厨房」"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    });
+    specs.push(ToolSpec {
+        spec_type: "function".to_string(),
+        function: super::provider::FunctionDef {
+            name: "wiki_page".to_string(),
+            description: "读取家庭知识库中某个实体的完整页面（分节 + 来源）。entity_type 取 member/thing/space/event/task/family，key_or_title 可传实体标题或 key。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "entity_type": {
+                        "type": "string",
+                        "enum": ["member", "thing", "space", "event", "task", "family"],
+                        "description": "实体类型"
+                    },
+                    "key_or_title": {
+                        "type": "string",
+                        "description": "实体标题或 key"
+                    }
+                },
+                "required": ["entity_type", "key_or_title"]
+            }),
+        },
+    });
+    specs.push(ToolSpec {
+        spec_type: "function".to_string(),
+        function: super::provider::FunctionDef {
+            name: "use_skill".to_string(),
+            description: "加载一个家庭场景包（技能包）的详细操作指引。场景包描述里写明了适用场景，遇到相符的家庭议题时加载它并按其指引回答。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "场景包标识"
+                    }
+                },
+                "required": ["skill_id"]
+            }),
+        },
+    });
+
     if jiabu_enabled {
         specs.push(ToolSpec {
             spec_type: "function".to_string(),
@@ -164,6 +264,48 @@ pub fn tool_specs(jiabu_enabled: bool) -> Vec<ToolSpec> {
                 name: "jiabu_score".to_string(),
                 description: "获取家庭幸福指数评分（JiaBu 决策引擎计算，含人/时/事/物/境五维）。回答「我们家怎么样、幸福指数多少」时调用。".to_string(),
                 parameters: json!({"type": "object", "properties": {}}),
+            },
+        });
+    }
+
+    if allow_write {
+        specs.push(ToolSpec {
+            spec_type: "function".to_string(),
+            function: super::provider::FunctionDef {
+                name: "propose_task".to_string(),
+                description: "提议为家庭新增一条待办。你不能直接写入 —— 这里只登记一条待用户确认的提议，用户确认后才会真正创建。".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "待办标题，一句话" },
+                        "description": { "type": "string", "description": "补充说明（可选）" },
+                        "due_date": { "type": "string", "description": "截止时间，RFC3339（可选）" },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "urgent"],
+                            "description": "优先级，默认 medium"
+                        }
+                    },
+                    "required": ["title"]
+                }),
+            },
+        });
+        specs.push(ToolSpec {
+            spec_type: "function".to_string(),
+            function: super::provider::FunctionDef {
+                name: "propose_event".to_string(),
+                description: "提议为家庭新增一条日程。你不能直接写入 —— 这里只登记一条待用户确认的提议，用户确认后才会真正创建。".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "日程标题" },
+                        "start_time": { "type": "string", "description": "开始时间，RFC3339" },
+                        "end_time": { "type": "string", "description": "结束时间，RFC3339（可选）" },
+                        "location": { "type": "string", "description": "地点（可选）" },
+                        "description": { "type": "string", "description": "补充说明（可选）" }
+                    },
+                    "required": ["title", "start_time"]
+                }),
             },
         });
     }
@@ -188,6 +330,11 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, arguments: &str) -> Result<
         "get_dashboard" => get_dashboard(ctx).await,
         "remember" => remember(ctx, args.content, args.kind).await,
         "jiabu_score" => jiabu_score(ctx).await,
+        "search_wiki" => search_wiki(ctx, args.query).await,
+        "wiki_page" => wiki_page(ctx, args.entity_type, args.key_or_title).await,
+        "use_skill" => use_skill(ctx, args.skill_id).await,
+        "propose_task" => propose_task(ctx, args).await,
+        "propose_event" => propose_event(ctx, args).await,
         other => Err(format!("unknown tool: {other}")),
     };
 
@@ -409,6 +556,162 @@ async fn jiabu_score(ctx: &ToolContext) -> Result<String, String> {
     Ok(body)
 }
 
+
+/// 解析 RFC3339 时间戳。
+fn parse_time(raw: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(raw.trim())
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| format!("invalid timestamp {raw}: {e}"))
+}
+
+/// 检索家庭 Wiki。
+async fn search_wiki(ctx: &ToolContext, query: Option<String>) -> Result<String, String> {
+    let q = query
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "search_wiki requires a non-empty query".to_string())?;
+    let hits = super::wiki::search(&ctx.db, ctx.family_id, &q, 20)
+        .await
+        .map_err(|e| format!("search_wiki failed: {e}"))?;
+    if hits.is_empty() {
+        return Ok(json!({"hits": [], "note": "家庭知识库中没有匹配的内容"}).to_string());
+    }
+    serde_json::to_string(&hits).map_err(|e| format!("serialize hits failed: {e}"))
+}
+
+/// 读取家庭 Wiki 的一个实体页。
+async fn wiki_page(
+    ctx: &ToolContext,
+    entity_type: Option<String>,
+    key_or_title: Option<String>,
+) -> Result<String, String> {
+    let et = entity_type
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "wiki_page requires entity_type".to_string())?;
+    if !matches!(
+        et.as_str(),
+        super::wiki::entity_type::MEMBER
+            | super::wiki::entity_type::THING
+            | super::wiki::entity_type::SPACE
+            | super::wiki::entity_type::EVENT
+            | super::wiki::entity_type::TASK
+            | super::wiki::entity_type::FAMILY
+    ) {
+        return Err(format!("invalid entity_type: {et}"));
+    }
+    let key = key_or_title
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "wiki_page requires key_or_title".to_string())?;
+    let detail = super::wiki::page_by_ref(&ctx.db, ctx.family_id, &et, &key)
+        .await
+        .map_err(|e| format!("wiki_page failed: {e}"))?;
+    match detail {
+        Some(d) => serde_json::to_string(&d).map_err(|e| format!("serialize page failed: {e}")),
+        None => Ok(json!({"found": false, "note": "家庭知识库里没有这个实体"}).to_string()),
+    }
+}
+
+/// 加载场景包（技能包）正文。
+async fn use_skill(ctx: &ToolContext, skill_id: Option<String>) -> Result<String, String> {
+    let sid = skill_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "use_skill requires a skill_id".to_string())?;
+    let m = super::skills::load_skill(&ctx.db, ctx.family_id, &ctx.skills_dir, &sid)
+        .await
+        .map_err(|e| format!("use_skill failed: {e}"))?;
+    Ok(super::skills::render_skill(&m))
+}
+
+/// 提议新增待办（不直接写入业务表）。
+async fn propose_task(ctx: &ToolContext, args: ToolArgs) -> Result<String, String> {
+    if !ctx.allow_write {
+        return Err("write proposals are disabled (HAMR_AGENT_ALLOW_WRITE=false)".to_string());
+    }
+    let title = args
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "propose_task requires a title".to_string())?;
+    let due_date = match args.due_date.as_deref() {
+        Some(d) if !d.trim().is_empty() => Some(parse_time(d)?),
+        _ => None,
+    };
+    let payload = json!({
+        "title": title,
+        "description": args.description,
+        "due_date": due_date,
+        "priority": args.priority,
+    });
+    let op = super::writeops::propose(
+        &ctx.db,
+        ctx.family_id,
+        ctx.member_id,
+        super::writeops::kind::CREATE_TASK,
+        payload,
+        None,
+    )
+    .await
+    .map_err(|e| format!("propose_task failed: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "operation_id": op.operation_id,
+        "status": op.status,
+        "preview": op.preview,
+        "note": "已登记待确认的提议，请用户在界面上确认后才会真正创建。"
+    })
+    .to_string())
+}
+
+/// 提议新增日程（不直接写入业务表）。
+async fn propose_event(ctx: &ToolContext, args: ToolArgs) -> Result<String, String> {
+    if !ctx.allow_write {
+        return Err("write proposals are disabled (HAMR_AGENT_ALLOW_WRITE=false)".to_string());
+    }
+    let title = args
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "propose_event requires a title".to_string())?;
+    let start_time = args
+        .start_time
+        .as_deref()
+        .map(parse_time)
+        .transpose()?
+        .ok_or_else(|| "propose_event requires start_time".to_string())?;
+    let end_time = match args.end_time.as_deref() {
+        Some(d) if !d.trim().is_empty() => Some(parse_time(d)?),
+        _ => None,
+    };
+    let payload = json!({
+        "title": title,
+        "start_time": start_time,
+        "end_time": end_time,
+        "location": args.location,
+        "description": args.description,
+    });
+    let op = super::writeops::propose(
+        &ctx.db,
+        ctx.family_id,
+        ctx.member_id,
+        super::writeops::kind::CREATE_EVENT,
+        payload,
+        None,
+    )
+    .await
+    .map_err(|e| format!("propose_event failed: {e}"))?;
+    Ok(json!({
+        "ok": true,
+        "operation_id": op.operation_id,
+        "status": op.status,
+        "preview": op.preview,
+        "note": "已登记待确认的提议，请用户在界面上确认后才会真正创建。"
+    })
+    .to_string())
+}
+
 /// 把工具结果包成一条 `tool` 消息。
 pub fn tool_message(tool_call_id: &str, content: &str) -> ChatMessage {
     ChatMessage::Tool {
@@ -423,7 +726,7 @@ mod tests {
 
     #[test]
     fn tool_specs_are_wellformed() {
-        let specs = tool_specs(false);
+        let specs = tool_specs(false, false);
         assert!(!specs.is_empty());
         for s in &specs {
             assert_eq!(s.spec_type, "function");
@@ -439,7 +742,7 @@ mod tests {
 
     #[test]
     fn tool_names_are_unique() {
-        let specs = tool_specs(true);
+        let specs = tool_specs(true, false);
         let mut names: Vec<&str> = specs.iter().map(|s| s.function.name.as_str()).collect();
         names.sort();
         let count = names.len();
@@ -449,15 +752,27 @@ mod tests {
 
     #[test]
     fn jiabu_tool_only_present_when_enabled() {
-        let with = tool_specs(true);
+        let with = tool_specs(true, false);
         assert!(with.iter().any(|s| s.function.name == "jiabu_score"));
-        let without = tool_specs(false);
+        let without = tool_specs(false, false);
         assert!(!without.iter().any(|s| s.function.name == "jiabu_score"));
     }
 
     #[test]
+    fn write_proposal_tools_only_present_when_write_allowed() {
+        // 写操作提议工具默认关闭 —— 关闭时模型看不到任何能触发落库路径的工具。
+        let readonly = tool_specs(false, false);
+        assert!(!readonly.iter().any(|s| s.function.name == "propose_task"));
+        assert!(!readonly.iter().any(|s| s.function.name == "propose_event"));
+
+        let writable = tool_specs(false, true);
+        assert!(writable.iter().any(|s| s.function.name == "propose_task"));
+        assert!(writable.iter().any(|s| s.function.name == "propose_event"));
+    }
+
+    #[test]
     fn remember_tool_requires_content_in_schema() {
-        let specs = tool_specs(false);
+        let specs = tool_specs(false, false);
         let remember = specs
             .iter()
             .find(|s| s.function.name == "remember")
@@ -468,7 +783,7 @@ mod tests {
     #[test]
     fn no_tool_exposes_family_id_parameter() {
         // family_id 必须由服务端注入 —— 模型参数里不该出现它。
-        for s in tool_specs(true) {
+        for s in tool_specs(true, false) {
             let props = &s.function.parameters["properties"];
             assert!(
                 props.get("family_id").is_none(),

@@ -249,6 +249,8 @@ impl Pagination {
 pub struct AgentSession {
     pub id: Uuid,
     pub family_id: Uuid,
+    /// 归属的家庭成员；为空表示家庭公共会话。
+    pub member_id: Option<Uuid>,
     pub title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

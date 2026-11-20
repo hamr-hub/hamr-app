@@ -84,6 +84,8 @@ impl From<crate::models::AgentMemory> for AgentMemory {
 pub struct AgentSession {
     pub id: Uuid,
     pub family_id: Uuid,
+    /// 归属的家庭成员；为空表示家庭公共会话。
+    pub member_id: Option<Uuid>,
     pub title: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -124,9 +126,14 @@ impl std::error::Error for StoreError {}
 /// 会话 / 记忆存储。
 pub trait ConversationStore: Send + Sync {
     /// 取得会话 ID；`session_id` 为 None 时新建一个。
+    ///
+    /// `member_id` 标识这次对话属于哪个家庭成员（None = 家庭公共会话）。
+    /// 它只用于标注会话归属与提示词视角，**不作为数据访问边界** ——
+    /// 数据边界仍是 family_id。
     fn ensure_session<'a>(
         &'a self,
         family_id: Uuid,
+        member_id: Option<Uuid>,
         session_id: Option<Uuid>,
     ) -> StoreFuture<'a, Uuid>;
 
@@ -210,6 +217,7 @@ impl ConversationStore for PgStore {
     fn ensure_session<'a>(
         &'a self,
         family_id: Uuid,
+        member_id: Option<Uuid>,
         session_id: Option<Uuid>,
     ) -> StoreFuture<'a, Uuid> {
         Box::pin(async move {
@@ -227,12 +235,15 @@ impl ConversationStore for PgStore {
                 // 客户端传了个过期 session_id 不该让整轮对话失败。
             }
             let id = Uuid::new_v4();
-            sqlx::query("INSERT INTO agent_sessions (id, family_id) VALUES ($1, $2)")
-                .bind(id)
-                .bind(family_id)
-                .execute(&self.db)
-                .await
-                .map_err(|e| StoreError::Db(e.to_string()))?;
+            sqlx::query(
+                "INSERT INTO agent_sessions (id, family_id, member_id) VALUES ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(family_id)
+            .bind(member_id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| StoreError::Db(e.to_string()))?;
             Ok(id)
         })
     }
@@ -306,6 +317,7 @@ impl ConversationStore for PgStore {
                 .map(|r| AgentSession {
                     id: r.id,
                     family_id: r.family_id,
+                    member_id: r.member_id,
                     title: r.title,
                     created_at: r.created_at,
                     updated_at: r.updated_at,
@@ -608,6 +620,7 @@ impl ConversationStore for MemStore {
     fn ensure_session<'a>(
         &'a self,
         family_id: Uuid,
+        member_id: Option<Uuid>,
         session_id: Option<Uuid>,
     ) -> StoreFuture<'a, Uuid> {
         Box::pin(async move {
@@ -621,6 +634,7 @@ impl ConversationStore for MemStore {
             let s = AgentSession {
                 id: Uuid::new_v4(),
                 family_id,
+                member_id,
                 title: None,
                 created_at: now,
                 updated_at: now,
@@ -882,13 +896,13 @@ mod tests {
     async fn mem_store_creates_and_reuses_sessions() {
         let store = MemStore::new();
         let fam = Uuid::new_v4();
-        let sid = store.ensure_session(fam, None).await.unwrap();
-        let again = store.ensure_session(fam, Some(sid)).await.unwrap();
+        let sid = store.ensure_session(fam, None, None).await.unwrap();
+        let again = store.ensure_session(fam, None, Some(sid)).await.unwrap();
         assert_eq!(sid, again, "已存在的会话应被复用");
 
         // 传一个不存在的 session_id 应该新建，而不是报错
         let fresh = store
-            .ensure_session(fam, Some(Uuid::new_v4()))
+            .ensure_session(fam, Some(Uuid::new_v4()), None)
             .await
             .unwrap();
         assert_ne!(fresh, sid);
@@ -898,7 +912,7 @@ mod tests {
     async fn mem_store_roundtrips_messages() {
         let store = MemStore::new();
         let fam = Uuid::new_v4();
-        let sid = store.ensure_session(fam, None).await.unwrap();
+        let sid = store.ensure_session(fam, None, None).await.unwrap();
         store.append(sid, &ChatMessage::user("你好")).await.unwrap();
         store
             .append(
@@ -920,7 +934,7 @@ mod tests {
     async fn mem_store_history_respects_limit_and_order() {
         let store = MemStore::new();
         let fam = Uuid::new_v4();
-        let sid = store.ensure_session(fam, None).await.unwrap();
+        let sid = store.ensure_session(fam, None, None).await.unwrap();
         for i in 0..5 {
             store
                 .append(sid, &ChatMessage::user(format!("m{i}")))
@@ -938,8 +952,8 @@ mod tests {
         let store = MemStore::new();
         let fam_a = Uuid::new_v4();
         let fam_b = Uuid::new_v4();
-        store.ensure_session(fam_a, None).await.unwrap();
-        store.ensure_session(fam_b, None).await.unwrap();
+        store.ensure_session(fam_a, None, None).await.unwrap();
+        store.ensure_session(fam_b, None, None).await.unwrap();
         let list = store.list_sessions(fam_a, 10).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].family_id, fam_a);
@@ -949,7 +963,7 @@ mod tests {
     async fn mem_store_delete_session_removes_messages() {
         let store = MemStore::new();
         let fam = Uuid::new_v4();
-        let sid = store.ensure_session(fam, None).await.unwrap();
+        let sid = store.ensure_session(fam, None, None).await.unwrap();
         store.append(sid, &ChatMessage::user("x")).await.unwrap();
         assert!(store.delete_session(sid).await.unwrap());
         assert!(store.history(sid, 10).await.unwrap().is_empty());

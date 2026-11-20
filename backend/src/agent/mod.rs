@@ -22,15 +22,23 @@
 //! - [`store`]    —— 会话 / 消息 / 长期记忆 / 提醒的持久化抽象
 //! - [`runner`]   —— 主循环（思考 → 调工具 → 观察 → 结论）
 //! - [`proactive`] —— 主动提醒：三态决策 + 闸门 + 规则扫描
+//! - [`wiki`]      —— 家庭 Wiki：实体页 + 来源引用 + 变更日志（模型只读）
+//! - [`skills`]    —— 技能包：版本化 SKILL.md + 服务端工具白名单
+//! - [`writeops`]  —— 审批写操作：模型提议 → 用户确认 → 幂等落库
+//! - [`probe`]     —— 模型体检：判断模型会不会调工具、会不会用工具结果
 
 pub mod config;
 pub mod privacy;
-pub mod proactive;
+pub mod probe;
 pub mod prompt;
+pub mod proactive;
 pub mod provider;
 pub mod runner;
+pub mod skills;
 pub mod store;
 pub mod tools;
+pub mod wiki;
+pub mod writeops;
 
 pub use config::AgentConfig;
 pub use runner::{AgentError, AgentRuntime, AgentStatus, StepTrace};

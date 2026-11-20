@@ -424,6 +424,8 @@ mod tests {
             quiet_start: 22 * 60,
             quiet_end: 7 * 60 + 30,
             daily_reminder_cap: 5,
+            skills_dir: std::path::PathBuf::from("skills"),
+            allow_write: false,
         }
     }
 

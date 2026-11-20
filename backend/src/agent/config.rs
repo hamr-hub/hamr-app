@@ -66,6 +66,13 @@ pub struct AgentConfig {
     pub quiet_end: u16,
     /// 每个家庭每天主动提醒条数上限（紧急旁路不受限）。
     pub daily_reminder_cap: u32,
+    /// 技能包根目录（磁盘）。技能文件形如 `<root>/<skill_id>/<version>/SKILL.md`。
+    pub skills_dir: std::path::PathBuf,
+    /// 是否允许 Agent 发起写操作**提议**。
+    ///
+    /// 默认 `false` —— 与 Agent 总开关同一个安全取向：
+    /// 写路径必须由用户显式开启，且提议本身仍需逐条确认才落库。
+    pub allow_write: bool,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -85,6 +92,8 @@ impl std::fmt::Debug for AgentConfig {
             .field("quiet_start", &self.quiet_start)
             .field("quiet_end", &self.quiet_end)
             .field("daily_reminder_cap", &self.daily_reminder_cap)
+            .field("skills_dir", &self.skills_dir)
+            .field("allow_write", &self.allow_write)
             .finish()
     }
 }
@@ -106,6 +115,8 @@ impl AgentConfig {
             quiet_start: 22 * 60,
             quiet_end: 7 * 60 + 30,
             daily_reminder_cap: 5,
+            skills_dir: std::path::PathBuf::from("skills"),
+            allow_write: false,
         }
     }
 
@@ -165,6 +176,12 @@ impl AgentConfig {
             parse_quiet_hours(&env_str("HAMR_AGENT_QUIET_HOURS", "22:00-07:30"))?;
         let daily_reminder_cap = env_int("HAMR_AGENT_DAILY_REMINDER_CAP", 5)?.clamp(0, 50) as u32;
 
+        // 技能包根目录：默认 ./skills（相对进程工作目录）。
+        let skills_dir = std::path::PathBuf::from(env_str("HAMR_AGENT_SKILLS_DIR", "skills"));
+
+        // 写操作提议默认关闭 —— 用户必须显式开启。
+        let allow_write = env_bool("HAMR_AGENT_ALLOW_WRITE", false)?;
+
         Ok(Self {
             enabled,
             provider,
@@ -179,6 +196,8 @@ impl AgentConfig {
             quiet_start,
             quiet_end,
             daily_reminder_cap,
+            skills_dir,
+            allow_write,
         })
     }
 
@@ -268,6 +287,8 @@ mod tests {
             "HAMR_JIABU_URL",
             "HAMR_AGENT_QUIET_HOURS",
             "HAMR_AGENT_DAILY_REMINDER_CAP",
+            "HAMR_AGENT_SKILLS_DIR",
+            "HAMR_AGENT_ALLOW_WRITE",
         ] {
             std::env::remove_var(k);
         }
@@ -403,6 +424,28 @@ mod tests {
         assert!(parse_quiet_hours("22:00").is_err());
         assert!(parse_quiet_hours("25:00-07:00").is_err());
         assert!(parse_quiet_hours("22:00-07:60").is_err());
+    }
+
+    #[test]
+    fn write_is_disabled_by_default() {
+        let _env = env_guard();
+        clear_env();
+        let cfg = AgentConfig::from_env().expect("config");
+        assert!(!cfg.allow_write, "写操作提议必须默认关闭");
+        std::env::set_var("HAMR_AGENT_ALLOW_WRITE", "true");
+        let cfg = AgentConfig::from_env().expect("config with write");
+        assert!(cfg.allow_write);
+    }
+
+    #[test]
+    fn skills_dir_is_configurable() {
+        let _env = env_guard();
+        clear_env();
+        let cfg = AgentConfig::from_env().expect("config");
+        assert_eq!(cfg.skills_dir, std::path::PathBuf::from("skills"));
+        std::env::set_var("HAMR_AGENT_SKILLS_DIR", "/tmp/hamr-skills");
+        let cfg = AgentConfig::from_env().expect("config with skills dir");
+        assert_eq!(cfg.skills_dir, std::path::PathBuf::from("/tmp/hamr-skills"));
     }
 
     #[test]

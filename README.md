@@ -39,3 +39,53 @@ docker compose up -d
 | 事务 | CRUD `/api/v1/tasks` |
 | 物品 | CRUD `/api/v1/things` |
 | 空间 | CRUD `/api/v1/spaces` |
+
+## 管家 Agent（`/api/v1/agent/*`）
+
+本地优先、模型可插拔的家庭 Agent 运行时。**默认关闭** —— 未设置 `HAMR_AGENT_ENABLED=true`
+时相关端点统一返回 503。
+
+| 能力 | 路径 |
+|------|------|
+| 对话 | POST `/api/v1/agent/chat` |
+| 会话 / 消息 | GET `/api/v1/agent/sessions`、`/sessions/:id/messages`、DELETE `/sessions/:id` |
+| 长期记忆 | GET/POST `/api/v1/agent/memories` |
+| 主动提醒 | GET `/api/v1/agent/reminders`、POST `/api/v1/agent/proactive/{scan,flush}` |
+| 家庭 Wiki | GET `/api/v1/agent/wiki`、`/wiki/search`、`/wiki/page`、`/wiki/changelog`、POST `/api/v1/agent/wiki/rebuild` |
+| 场景包 | GET `/api/v1/agent/skills`、`/skills/available`、POST `/api/v1/agent/skills/{install,enabled}` |
+| 写操作审批 | GET `/api/v1/agent/write-ops`、POST `/api/v1/agent/write-ops/:id/{confirm,reject}` |
+| 模型体检 | POST `/api/v1/agent/probe` |
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `HAMR_AGENT_ENABLED` | `false` | 总开关 |
+| `HAMR_AGENT_PROVIDER` | `local` | `local`（Ollama 等 OpenAI 兼容本地端点）/ `cloud` |
+| `HAMR_AGENT_BASE_URL` | `http://127.0.0.1:11434/v1` | 模型端点 |
+| `HAMR_AGENT_MODEL` | `qwen2.5:7b` | 模型名 |
+| `HAMR_AGENT_API_KEY` | — | 云端必填 |
+| `HAMR_AGENT_ALLOW_PII` | `false` | 云端路径下是否允许原始 PII 出网 |
+| `HAMR_AGENT_MAX_STEPS` | `8` | 单轮「思考→调工具」循环上限 |
+| `HAMR_AGENT_QUIET_HOURS` | `22:00-07:30` | 免打扰时段（主动提醒） |
+| `HAMR_AGENT_DAILY_REMINDER_CAP` | `5` | 每日主动提醒条数上限 |
+| `HAMR_AGENT_SKILLS_DIR` | `skills` | 场景包根目录 |
+| `HAMR_AGENT_ALLOW_WRITE` | `false` | 是否允许 Agent 发起写操作**提议**（落库仍需人工确认） |
+
+### 不变量
+
+Agent 默认关闭 · 工具只读（v1）· `family_id` 由服务端注入 · 出网必脱敏 · 步数有界 ·
+写操作必须经人显式确认且工具表内无 confirm 类工具 · 场景包只收敛工具面不授权 ·
+Wiki 页面只有重建器能写。
+
+### 开发
+
+```bash
+# 单元测试
+cargo test --bin hamr-app-server
+
+# 端到端验证（真实 Postgres + 真实后端进程 + 假模型）
+bash scripts/e2e/run.sh
+```
+
+场景包格式见 [`backend/skills/README.md`](backend/skills/README.md)。

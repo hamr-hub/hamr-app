@@ -29,6 +29,9 @@ pub struct ChatRequest {
     /// 续用已有会话；不传则新建。
     #[serde(default)]
     pub session_id: Option<Uuid>,
+    /// 当前对话属于哪位家庭成员；不传表示家庭公共会话。
+    #[serde(default)]
+    pub member_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,7 +86,7 @@ pub async fn chat(
 ) -> AppResult<Json<ChatResponse>> {
     let rt = runtime(&state)?;
     let outcome = rt
-        .run(req.family_id, &req.message, req.session_id)
+        .run(req.family_id, req.member_id, &req.message, req.session_id)
         .await
         .map_err(map_err)?;
     Ok(Json(ChatResponse {
@@ -256,6 +259,259 @@ pub async fn list_reminders(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e.to_string())))?;
     Ok(Json(reminders))
+}
+
+/// 重建家庭 Wiki（从五维数据确定性派生）。
+pub async fn wiki_rebuild(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Json(req): Json<ProactiveRequest>,
+) -> AppResult<Json<crate::agent::wiki::RebuildReport>> {
+    let report = crate::agent::wiki::rebuild(&state.db, req.family_id)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(report))
+}
+
+/// 家庭 Wiki 摘要索引。
+pub async fn wiki_index(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<crate::agent::wiki::WikiPage>>> {
+    let family_id = require_family(&params)?;
+    let pages = crate::agent::wiki::summary_index(&state.db, family_id, 200)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(pages))
+}
+
+/// 家庭 Wiki 检索。
+pub async fn wiki_search(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<crate::agent::wiki::WikiHit>>> {
+    let family_id = require_family(&params)?;
+    let query = params.get("query").cloned().unwrap_or_default();
+    let hits = crate::agent::wiki::search(&state.db, family_id, &query, 50)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(hits))
+}
+
+/// 家庭 Wiki 单页详情（含来源引用）。
+pub async fn wiki_page(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<serde_json::Value>> {
+    let family_id = require_family(&params)?;
+    let entity_type = params
+        .get("entity_type")
+        .cloned()
+        .ok_or_else(|| AppError::ValidationError("entity_type required".into()))?;
+    let key = params
+        .get("key")
+        .cloned()
+        .ok_or_else(|| AppError::ValidationError("key required".into()))?;
+    let detail = crate::agent::wiki::page_by_ref(&state.db, family_id, &entity_type, &key)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(match detail {
+        Some(d) => serde_json::to_value(d).unwrap_or(serde_json::Value::Null),
+        None => serde_json::json!({ "found": false }),
+    }))
+}
+
+/// 家庭 Wiki 变更日志。
+pub async fn wiki_changelog(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    let family_id = require_family(&params)?;
+    let log = crate::agent::wiki::changelog(&state.db, family_id, 100)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(log))
+}
+
+/// 已安装的场景包。
+pub async fn list_skills(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    let family_id = require_family(&params)?;
+    let rows = crate::agent::skills::list_installed(&state.db, family_id)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(r, enabled)| {
+                serde_json::json!({
+                    "skill_id": r.skill_id,
+                    "version": r.version,
+                    "name": r.name,
+                    "description": r.description,
+                    "path": r.path,
+                    "tools": r.tools,
+                    "enabled": enabled,
+                })
+            })
+            .collect(),
+    ))
+}
+
+/// 磁盘上可安装的场景包。
+pub async fn scan_skills(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<serde_json::Value>>> {
+    let root = state
+        .agent
+        .as_deref()
+        .map(|rt| rt.skills_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("skills"));
+    Ok(Json(
+        crate::agent::skills::scan_disk(&root)
+            .into_iter()
+            .map(|(skill_id, version, path)| {
+                serde_json::json!({ "skill_id": skill_id, "version": version, "path": path })
+            })
+            .collect(),
+    ))
+}
+
+/// 安装（登记）一个场景包。
+#[derive(Debug, Deserialize)]
+pub struct InstallSkillRequest {
+    pub family_id: Uuid,
+    pub skill_id: String,
+    pub version: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+pub async fn install_skill(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Json(req): Json<InstallSkillRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let root = state
+        .agent
+        .as_deref()
+        .map(|rt| rt.skills_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("skills"));
+    let row = crate::agent::skills::install(
+        &state.db,
+        req.family_id,
+        &root,
+        &req.skill_id,
+        &req.version,
+        req.enabled,
+    )
+    .await
+    .map_err(AppError::ValidationError)?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "skill_id": row.skill_id,
+        "version": row.version,
+        "name": row.name,
+    })))
+}
+
+/// 启用 / 停用场景包。
+#[derive(Debug, Deserialize)]
+pub struct ToggleSkillRequest {
+    pub family_id: Uuid,
+    pub skill_id: String,
+    pub version: String,
+    pub enabled: bool,
+}
+
+pub async fn toggle_skill(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Json(req): Json<ToggleSkillRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let ok = crate::agent::skills::set_enabled(
+        &state.db,
+        req.family_id,
+        &req.skill_id,
+        &req.version,
+        req.enabled,
+    )
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    if !ok {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// 写操作列表（待确认的提议等）。
+pub async fn list_write_ops(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<crate::agent::writeops::WriteOp>>> {
+    let family_id = require_family(&params)?;
+    let status = params.get("status").map(|s| s.trim().to_string());
+    let ops = crate::agent::writeops::list_ops(&state.db, family_id, status.as_deref(), 100)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e)))?;
+    Ok(Json(ops))
+}
+
+/// 确认一次写操作 —— 真正落库。幂等。
+#[derive(Debug, Deserialize)]
+pub struct WriteOpRequest {
+    pub family_id: Uuid,
+}
+
+pub async fn confirm_write_op(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Path(operation_id): Path<Uuid>,
+    Json(req): Json<WriteOpRequest>,
+) -> AppResult<Json<crate::agent::writeops::WriteOp>> {
+    let op = crate::agent::writeops::confirm(&state.db, req.family_id, operation_id)
+        .await
+        .map_err(AppError::ValidationError)?;
+    Ok(Json(op))
+}
+
+/// 否决一次写操作。
+pub async fn reject_write_op(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Path(operation_id): Path<Uuid>,
+    Json(req): Json<WriteOpRequest>,
+) -> AppResult<Json<crate::agent::writeops::WriteOp>> {
+    let op = crate::agent::writeops::reject(&state.db, req.family_id, operation_id)
+        .await
+        .map_err(AppError::ValidationError)?;
+    Ok(Json(op))
+}
+
+/// 模型体检：判断当前模型会不会调工具。
+pub async fn probe(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+) -> AppResult<Json<crate::agent::probe::ProbeResult>> {
+    let rt = runtime(&state)?;
+    let result = rt.probe().await.map_err(map_err)?;
+    Ok(Json(result))
+}
+
+/// 取出 family_id 查询参数。
+fn require_family(params: &HashMap<String, String>) -> AppResult<Uuid> {
+    params
+        .get("family_id")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AppError::ValidationError("family_id required".into()))
 }
 
 /// Agent 运行状态（不含任何密钥）。

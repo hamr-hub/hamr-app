@@ -98,6 +98,29 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/agent/proactive/flush",
             post(agent::proactive_flush),
         )
+        // 家庭 Wiki：知识层。模型只读，人可读可重建。
+        .route("/api/v1/agent/wiki", get(agent::wiki_index))
+        .route("/api/v1/agent/wiki/rebuild", post(agent::wiki_rebuild))
+        .route("/api/v1/agent/wiki/search", get(agent::wiki_search))
+        .route("/api/v1/agent/wiki/page", get(agent::wiki_page))
+        .route("/api/v1/agent/wiki/changelog", get(agent::wiki_changelog))
+        // 场景包：版本化、不可变、每个家庭单独开关。
+        .route("/api/v1/agent/skills", get(agent::list_skills))
+        .route("/api/v1/agent/skills/available", get(agent::scan_skills))
+        .route("/api/v1/agent/skills/install", post(agent::install_skill))
+        .route("/api/v1/agent/skills/enabled", post(agent::toggle_skill))
+        // 审批写操作：确认走 HTTP，不给模型 confirm 工具。
+        .route("/api/v1/agent/write-ops", get(agent::list_write_ops))
+        .route(
+            "/api/v1/agent/write-ops/:id/confirm",
+            post(agent::confirm_write_op),
+        )
+        .route(
+            "/api/v1/agent/write-ops/:id/reject",
+            post(agent::reject_write_op),
+        )
+        // 模型体检：判断当前模型会不会调工具。
+        .route("/api/v1/agent/probe", post(agent::probe))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

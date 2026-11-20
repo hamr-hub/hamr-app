@@ -32,7 +32,7 @@ use super::config::AgentConfig;
 use super::privacy::Redactor;
 use super::proactive::{self, ScanReport, ToldItem};
 use super::prompt;
-use super::provider::{ChatMessage, ChatRequest, LlmProvider, ProviderError};
+use super::provider::{ChatMessage, ChatRequest, LlmProvider, ProviderError, ToolSpec};
 use super::store::{ConversationStore, StoreError};
 use super::tools::{self, ToolContext};
 
@@ -160,15 +160,21 @@ impl AgentRuntime {
         }
     }
 
+    pub fn skills_dir(&self) -> &std::path::Path { &self.config.skills_dir }
+
     /// 取存储句柄（会话 / 记忆管理端点用）。
     pub fn store(&self) -> Arc<dyn ConversationStore> {
         self.store.clone()
     }
 
     /// 跑一轮对话。
+    ///
+    /// `member_id` 标识这次对话属于哪位家庭成员 —— 只影响提示词视角与会话归属，
+    /// **不构成数据访问边界**（数据边界始终是 family_id）。
     pub async fn run(
         &self,
         family_id: Uuid,
+        member_id: Option<Uuid>,
         message: &str,
         session_id: Option<Uuid>,
     ) -> Result<AgentOutcome, AgentError> {
@@ -177,15 +183,43 @@ impl AgentRuntime {
             return Err(AgentError::InvalidInput("message is empty".into()));
         }
 
-        let session_id = self.store.ensure_session(family_id, session_id).await?;
+        let session_id = self.store.ensure_session(family_id, member_id, session_id).await?;
         let memories = self.store.memories(family_id, 20).await?;
         let history = self
             .store
             .history(session_id, self.config.max_history)
             .await?;
 
-        let mut messages = vec![ChatMessage::system(prompt::system_prompt(&memories))];
-        messages.extend(history);
+        // 知识层：Wiki 摘要索引 + 场景包目录（正文按需加载，不进提示词）
+        let wiki_pages = super::wiki::summary_index(&self.db, family_id, 40)
+            .await
+            .unwrap_or_default();
+        let wiki_index = super::wiki::render_index(&wiki_pages);
+        let skill_items = super::skills::load_enabled(&self.db, family_id, &self.config.skills_dir)
+            .await
+            .unwrap_or_default();
+        let skill_catalog = super::skills::render_catalog(&skill_items);
+        let member_name = match member_id {
+            Some(id) => sqlx::query_scalar::<_, String>(
+                "SELECT name FROM people WHERE family_id = $1 AND id = $2",
+            )
+            .bind(family_id)
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await
+            .unwrap_or(None),
+            None => None,
+        };
+
+        let mut messages = vec![ChatMessage::system(prompt::system_prompt(
+            prompt::PromptInput {
+                memories: &memories,
+                wiki_index: Some(&wiki_index),
+                member_name: member_name.as_deref(),
+                skill_catalog: Some(&skill_catalog),
+            },
+        ))];
+        messages.extend(history.iter().cloned());
         messages.push(ChatMessage::user(message));
         self.store
             .append(session_id, messages.last().expect("just pushed"))
@@ -202,16 +236,21 @@ impl AgentRuntime {
             messages.clone()
         };
 
-        let specs = tools::tool_specs(self.config.jiabu_url.is_some());
+        // 工具面：默认工具集 +（若历史里加载过场景包）按其白名单收敛。
+        let specs = tools::tool_specs(self.config.jiabu_url.is_some(), self.config.allow_write);
+        let specs = self.narrow_by_skill(family_id, &history, specs).await;
         let ctx = ToolContext {
             db: self.db.clone(),
             store: self.store.clone(),
             family_id,
+            member_id,
             allow_pii: self.config.allow_pii,
             redactor: redactor.clone(),
             jiabu_url: self.config.jiabu_url.clone(),
             http: self.http.clone(),
             provider: self.config.provider,
+            skills_dir: self.config.skills_dir.clone(),
+            allow_write: self.config.allow_write,
         };
 
         let mut steps: Vec<StepTrace> = Vec::new();
@@ -313,6 +352,66 @@ impl AgentRuntime {
         Ok(report)
     }
 
+    /// 按最近加载的场景包收敛工具面。
+    ///
+    /// 场景包声明的 `tools` 白名单是「这个场景该用哪些工具」，不是授权 ——
+    /// 服务端仍然逐个鉴权。但收敛工具面能显著降低模型跑偏的概率，
+    /// 也让场景包的意图真正落到行为上。
+    ///
+    /// 知识层工具（use_skill / search_wiki / wiki_page）始终保留 ——
+    /// 否则模型加载了场景包后就再也换不了场景、查不了详情。
+    async fn narrow_by_skill(
+        &self,
+        family_id: Uuid,
+        history: &[ChatMessage],
+        specs: Vec<ToolSpec>,
+    ) -> Vec<ToolSpec> {
+        const ALWAYS: [&str; 3] = ["use_skill", "search_wiki", "wiki_page"];
+
+        let mut last_skill: Option<String> = None;
+        for m in history {
+            if let ChatMessage::Assistant {
+                tool_calls: Some(calls),
+                ..
+            } = m
+            {
+                for c in calls {
+                    if c.function.name == "use_skill" {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&c.function.arguments)
+                        {
+                            if let Some(sid) = v.get("skill_id").and_then(|x| x.as_str()) {
+                                last_skill = Some(sid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(sid) = last_skill else {
+            return specs;
+        };
+        let Ok(manifest) =
+            super::skills::load_skill(&self.db, family_id, &self.config.skills_dir, &sid).await
+        else {
+            return specs;
+        };
+        if manifest.tools.is_empty() {
+            return specs;
+        }
+        specs
+            .into_iter()
+            .filter(|s| {
+                ALWAYS.contains(&s.function.name.as_str())
+                    || super::skills::tool_allowed(&manifest, &s.function.name)
+            })
+            .collect()
+    }
+
+    /// 模型体检：判断当前模型会不会调工具、会不会用工具结果。
+    pub async fn probe(&self) -> Result<super::probe::ProbeResult, AgentError> {
+        Ok(super::probe::probe(self.provider.as_ref()).await)
+    }
+
     /// 放行到期提醒（免打扰结束 / 新的一天由调度方调用）。
     pub async fn proactive_flush(&self, family_id: Uuid) -> Result<Vec<ToldItem>, AgentError> {
         let now = Utc::now();
@@ -353,6 +452,9 @@ pub(crate) fn test_ctx() -> ToolContext {
         jiabu_url: None,
         http: reqwest::Client::new(),
         provider: super::config::ProviderKind::Local,
+        member_id: None,
+        skills_dir: std::path::PathBuf::from("skills"),
+        allow_write: false,
     }
 }
 
@@ -377,6 +479,8 @@ mod tests {
             quiet_start: 22 * 60,
             quiet_end: 7 * 60 + 30,
             daily_reminder_cap: 5,
+            skills_dir: std::path::PathBuf::from("skills"),
+            allow_write: false,
         }
     }
 
@@ -402,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_message() {
         let rt = runtime(Arc::new(StubProvider::new(vec![])), config());
-        let err = rt.run(Uuid::new_v4(), "   ", None).await.unwrap_err();
+        let err = rt.run(Uuid::new_v4(), None,"   ", None).await.unwrap_err();
         assert!(matches!(err, AgentError::InvalidInput(_)));
     }
 
@@ -413,7 +517,7 @@ mod tests {
         )]));
         let rt = runtime(provider, config());
         let out = rt
-            .run(Uuid::new_v4(), "明天下午有事吗", None)
+            .run(Uuid::new_v4(), None, "明天下午有事吗", None)
             .await
             .unwrap();
         assert_eq!(out.reply, "明天下午三点有家长会。");
@@ -435,7 +539,7 @@ mod tests {
         ]));
         let rt = runtime(provider, config());
         let out = rt
-            .run(Uuid::new_v4(), "我还有什么事没做", None)
+            .run(Uuid::new_v4(), None, "我还有什么事没做", None)
             .await
             .unwrap();
         assert_eq!(out.reply, "还有 3 件待办没完成。");
@@ -455,7 +559,7 @@ mod tests {
             ChatResponse::final_text("工具那边出了点问题，我先按现有信息回答。"),
         ]));
         let rt = runtime(provider, config());
-        let out = rt.run(Uuid::new_v4(), "随便问问", None).await.unwrap();
+        let out = rt.run(Uuid::new_v4(), None,"随便问问", None).await.unwrap();
         assert!(out.reply.contains("出了点问题"));
         assert_eq!(out.tool_calls, 1);
     }
@@ -474,7 +578,7 @@ mod tests {
         let mut cfg = config();
         cfg.max_steps = 3;
         let rt = runtime(provider, cfg);
-        let out = rt.run(Uuid::new_v4(), "无限循环", None).await.unwrap();
+        let out = rt.run(Uuid::new_v4(), None,"无限循环", None).await.unwrap();
         assert_eq!(out.tool_calls, 3, "工具调用次数应受 max_steps 限制");
         assert_eq!(out.reply, prompt::FALLBACK_REPLY);
     }
@@ -492,12 +596,12 @@ mod tests {
         let provider = Arc::new(StubProvider::new(vec![ChatResponse::final_text("好的")]));
         let rt = AgentRuntime::new(config(), provider, store.clone(), db.clone());
         let fam = Uuid::new_v4();
-        let out = rt.run(fam, "记住我喜欢喝茶", None).await.unwrap();
+        let out = rt.run(fam, None,"记住我喜欢喝茶", None).await.unwrap();
 
         let provider2 = Arc::new(StubProvider::new(vec![ChatResponse::final_text("好的")]));
         let rt2 = AgentRuntime::new(config(), provider2, store.clone(), db);
         let out2 = rt2
-            .run(fam, "我刚才说了什么", Some(out.session_id))
+            .run(fam, None, "我刚才说了什么", Some(out.session_id))
             .await
             .unwrap();
         assert_eq!(out2.session_id, out.session_id, "应续用同一个会话");
@@ -522,7 +626,7 @@ mod tests {
         cfg.allow_pii = false;
         let rt = runtime(provider, cfg);
         let out = rt
-            .run(Uuid::new_v4(), "我的邮箱是 a@b.cn", None)
+            .run(Uuid::new_v4(), None, "我的邮箱是 a@b.cn", None)
             .await
             .unwrap();
         assert!(out.redacted, "云端 + 未放开 PII 时应标记为脱敏");
@@ -532,7 +636,7 @@ mod tests {
     async fn local_provider_does_not_redact() {
         let provider = Arc::new(StubProvider::new(vec![ChatResponse::final_text("好的")]));
         let rt = runtime(provider, config());
-        let out = rt.run(Uuid::new_v4(), "a@b.cn", None).await.unwrap();
+        let out = rt.run(Uuid::new_v4(), None,"a@b.cn", None).await.unwrap();
         assert!(!out.redacted, "本地模型不需要脱敏");
     }
 
