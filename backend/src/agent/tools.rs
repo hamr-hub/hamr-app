@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::config::ProviderKind;
 use super::privacy::Redactor;
 use super::provider::{ChatMessage, ToolSpec};
-use super::store::ConversationStore;
+use super::store::{ConversationStore, MemoryKind};
 
 /// 工具执行上下文。
 pub struct ToolContext {
@@ -51,6 +51,7 @@ struct ToolArgs {
     status: Option<String>,
     category: Option<String>,
     content: Option<String>,
+    kind: Option<String>,
 }
 
 /// 构造工具列表。`jiabu_enabled` 决定是否暴露幸福指数工具。
@@ -136,13 +137,18 @@ pub fn tool_specs(jiabu_enabled: bool) -> Vec<ToolSpec> {
             spec_type: "function".to_string(),
             function: super::provider::FunctionDef {
                 name: "remember".to_string(),
-                description: "记录一条长期记忆（如家庭偏好、过敏史、重要约定），之后的对话会自动带上。只记录用户明确要求记住或对话中明确成立的长期事实，不要记录临时状态。".to_string(),
+                description: "记录一条长期记忆（家庭偏好、过敏史、重要约定等），之后的对话会自动带上。只记录用户明确要求记住或对话中明确成立的长期事实，不要记录临时状态。kind 取值：fact=长期事实（默认），preference=偏好线索（被再次确认会升级为家规），rule=明确的家规/硬性规则。".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
                             "description": "记忆内容，一句话"
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["fact", "preference", "rule"],
+                            "description": "记忆类型，默认 fact；用户说「以后都/必须/别再」这类硬性要求时用 rule；口味、作息等偏好用 preference"
                         }
                     },
                     "required": ["content"]
@@ -180,7 +186,7 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, arguments: &str) -> Result<
         "list_things" => list_things(ctx, args.status, args.category).await,
         "list_spaces" => list_spaces(ctx).await,
         "get_dashboard" => get_dashboard(ctx).await,
-        "remember" => remember(ctx, args.content).await,
+        "remember" => remember(ctx, args.content, args.kind).await,
         "jiabu_score" => jiabu_score(ctx).await,
         other => Err(format!("unknown tool: {other}")),
     };
@@ -340,7 +346,11 @@ async fn get_dashboard(ctx: &ToolContext) -> Result<String, String> {
     serde_json::to_string(&stats).map_err(|e| format!("serialize dashboard failed: {e}"))
 }
 
-async fn remember(ctx: &ToolContext, content: Option<String>) -> Result<String, String> {
+async fn remember(
+    ctx: &ToolContext,
+    content: Option<String>,
+    kind: Option<String>,
+) -> Result<String, String> {
     let content = content
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
@@ -348,12 +358,32 @@ async fn remember(ctx: &ToolContext, content: Option<String>) -> Result<String, 
     if content.chars().count() > 500 {
         return Err("memory content too long (max 500 chars)".to_string());
     }
-    let id = ctx
+
+    // kind 由模型给出，但取值必须由我们判定 —— 非法值直接回喂模型让它改。
+    let kind = match kind.as_deref().map(str::trim) {
+        None | Some("") => MemoryKind::Fact,
+        Some(raw) => MemoryKind::parse(raw).ok_or_else(|| {
+            format!("invalid memory kind: {raw} (expected one of fact / preference / rule)")
+        })?,
+    };
+
+    // clue → rule：内容已存在说明用户再次确认同一条 —— 强化它，
+    // 偏好类会就地升级为家规，而不是插入一条重复记忆。
+    // 存储层用一条语句完成「插入或强化」，并发下也不会写出两行。
+    let m = ctx
         .store
-        .add_memory(ctx.family_id, &content, "agent")
+        .remember(ctx.family_id, &content, "agent", kind)
         .await
         .map_err(|e| format!("remember failed: {e}"))?;
-    Ok(json!({"ok": true, "memory_id": id}).to_string())
+
+    Ok(json!({
+        "ok": true,
+        "memory_id": m.id,
+        "reinforced": m.reinforced_count > 0,
+        "kind": m.kind.as_str(),
+        "reinforced_count": m.reinforced_count,
+    })
+    .to_string())
 }
 
 async fn jiabu_score(ctx: &ToolContext) -> Result<String, String> {
@@ -478,5 +508,46 @@ mod tests {
             }
             _ => panic!("应构造 tool 消息"),
         }
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_invalid_kind() {
+        let ctx = crate::agent::runner::test_ctx();
+        let err = dispatch(&ctx, "remember", r#"{"content":"x","kind":"weird"}"#)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid memory kind"), "实际: {err}");
+    }
+
+    #[tokio::test]
+    async fn remember_stores_with_kind_and_reinforces_on_repeat() {
+        let ctx = crate::agent::runner::test_ctx();
+        let fam = ctx.family_id;
+
+        let first = dispatch(
+            &ctx,
+            "remember",
+            r#"{"content":"晚饭别放香菜","kind":"preference"}"#,
+        )
+        .await
+        .unwrap();
+        assert!(first.contains("\"reinforced\":false"), "实际: {first}");
+        assert!(first.contains("\"kind\":\"preference\""), "实际: {first}");
+
+        // 同一内容再来一次 → 强化；偏好升级为家规
+        let second = dispatch(
+            &ctx,
+            "remember",
+            r#"{"content":"晚饭别放香菜","kind":"preference"}"#,
+        )
+        .await
+        .unwrap();
+        assert!(second.contains("\"reinforced\":true"), "实际: {second}");
+        assert!(second.contains("\"kind\":\"rule\""), "实际: {second}");
+
+        // 不应产生重复记忆行
+        let mems = ctx.store.memories(fam, 50).await.unwrap();
+        assert_eq!(mems.len(), 1, "重复 remember 不应新增记忆行");
+        assert_eq!(mems[0].kind, MemoryKind::Rule);
     }
 }

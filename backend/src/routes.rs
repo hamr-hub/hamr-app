@@ -92,6 +92,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/agent/memories", get(agent::list_memories))
         .route("/api/v1/agent/memories", post(agent::add_memory))
+        .route("/api/v1/agent/reminders", get(agent::list_reminders))
+        .route("/api/v1/agent/proactive/scan", post(agent::proactive_scan))
+        .route(
+            "/api/v1/agent/proactive/flush",
+            post(agent::proactive_flush),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

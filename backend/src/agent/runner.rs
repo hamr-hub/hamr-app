@@ -24,11 +24,13 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use serde::Serialize;
 use uuid::Uuid;
 
 use super::config::AgentConfig;
 use super::privacy::Redactor;
+use super::proactive::{self, ScanReport, ToldItem};
 use super::prompt;
 use super::provider::{ChatMessage, ChatRequest, LlmProvider, ProviderError};
 use super::store::{ConversationStore, StoreError};
@@ -104,6 +106,11 @@ pub struct AgentStatus {
     pub redacts_pii: bool,
     pub max_steps: u32,
     pub jiabu_enabled: bool,
+    /// 免打扰时段（本地时区，一天中的第几分钟）。
+    pub quiet_start: u16,
+    pub quiet_end: u16,
+    /// 每日主动提醒条数上限。
+    pub daily_reminder_cap: u32,
 }
 
 /// Agent 运行时。
@@ -147,6 +154,9 @@ impl AgentRuntime {
             redacts_pii: info.redacts_pii,
             max_steps: self.config.max_steps,
             jiabu_enabled: self.config.jiabu_url.is_some(),
+            quiet_start: self.config.quiet_start,
+            quiet_end: self.config.quiet_end,
+            daily_reminder_cap: self.config.daily_reminder_cap,
         }
     }
 
@@ -292,6 +302,23 @@ impl AgentRuntime {
         .unwrap_or_default();
         Redactor::new(&names)
     }
+
+    /// 主动扫描一轮：从五维数据取候选信号，过闸门后落库。
+    ///
+    /// 全程不调用模型 —— 规则判定，不出网、不涉脱敏。
+    pub async fn proactive_scan(&self, family_id: Uuid) -> Result<ScanReport, AgentError> {
+        let now = Utc::now();
+        let report =
+            proactive::scan(&self.db, self.store.as_ref(), family_id, now, &self.config).await?;
+        Ok(report)
+    }
+
+    /// 放行到期提醒（免打扰结束 / 新的一天由调度方调用）。
+    pub async fn proactive_flush(&self, family_id: Uuid) -> Result<Vec<ToldItem>, AgentError> {
+        let now = Utc::now();
+        let items = proactive::flush_due(self.store.as_ref(), family_id, now, &self.config).await?;
+        Ok(items)
+    }
 }
 
 /// 工具结果摘要（写进轨迹，便于人工回看这一轮 Agent 干了什么）。
@@ -347,6 +374,9 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_history: 20,
             jiabu_url: None,
+            quiet_start: 22 * 60,
+            quiet_end: 7 * 60 + 30,
+            daily_reminder_cap: 5,
         }
     }
 

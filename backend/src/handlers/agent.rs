@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::agent::{AgentError, AgentRuntime, AgentStatus};
+use crate::agent::proactive::{AgentReminder, ReminderStatus, ScanReport, ToldItem};
+use crate::agent::{AgentError, AgentRuntime, AgentStatus, MemoryKind};
 use crate::db::AppState;
 use crate::errors::{AppError, AppResult};
 use crate::middleware::Claims;
@@ -43,6 +44,15 @@ pub struct ChatResponse {
 pub struct AddMemoryRequest {
     pub family_id: Uuid,
     pub content: String,
+    /// fact / preference / rule，不填按 fact。
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// 主动扫描请求。
+#[derive(Debug, Deserialize)]
+pub struct ProactiveRequest {
+    pub family_id: Uuid,
 }
 
 /// 取出运行时；未启用时返回 503。
@@ -170,14 +180,82 @@ pub async fn add_memory(
     if content.is_empty() {
         return Err(AppError::ValidationError("content is empty".into()));
     }
+    let kind = match req.kind.as_deref().map(str::trim) {
+        None | Some("") => MemoryKind::Fact,
+        Some(raw) => MemoryKind::parse(raw).ok_or_else(|| {
+            AppError::ValidationError(format!(
+                "invalid kind: {raw} (expected one of fact / preference / rule)"
+            ))
+        })?,
+    };
     let store = state
         .agent_store()
         .ok_or_else(|| AppError::AgentUnavailable("agent runtime is not enabled".into()))?;
-    let id = store
-        .add_memory(req.family_id, content, "manual")
+    // 与模型工具走同一条写入路径：内容已存在即视为再次确认（强化），
+    // 不会写出两条重复记忆。
+    let m = store
+        .remember(req.family_id, content, "manual", kind)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!(e.to_string())))?;
-    Ok(Json(serde_json::json!({ "ok": true, "memory_id": id })))
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "memory_id": m.id,
+        "kind": m.kind.as_str(),
+        "reinforced": m.reinforced_count > 0,
+        "reinforced_count": m.reinforced_count,
+    })))
+}
+
+/// 主动扫描一轮：查五维数据 → 过闸门 → 落库，返回本轮要告知的提醒。
+///
+/// 全程不调用模型，不出网。
+pub async fn proactive_scan(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Json(req): Json<ProactiveRequest>,
+) -> AppResult<Json<ScanReport>> {
+    let rt = runtime(&state)?;
+    let report = rt.proactive_scan(req.family_id).await.map_err(map_err)?;
+    Ok(Json(report))
+}
+
+/// 放行到期提醒（免打扰结束后由调度方调用）。
+pub async fn proactive_flush(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Json(req): Json<ProactiveRequest>,
+) -> AppResult<Json<Vec<ToldItem>>> {
+    let rt = runtime(&state)?;
+    let items = rt.proactive_flush(req.family_id).await.map_err(map_err)?;
+    Ok(Json(items))
+}
+
+/// 提醒列表（可按状态过滤）。
+pub async fn list_reminders(
+    Extension(_claims): Extension<Claims>,
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AppResult<Json<Vec<AgentReminder>>> {
+    let family_id: Uuid = params
+        .get("family_id")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AppError::ValidationError("family_id required".into()))?;
+    let status = match params.get("status").map(|s| s.trim()) {
+        None | Some("") => None,
+        Some(raw) => Some(ReminderStatus::parse(raw).ok_or_else(|| {
+            AppError::ValidationError(format!(
+                "invalid status: {raw} (expected one of pending / told / snoozed / dismissed)"
+            ))
+        })?),
+    };
+    let store = state
+        .agent_store()
+        .ok_or_else(|| AppError::AgentUnavailable("agent runtime is not enabled".into()))?;
+    let reminders = store
+        .reminders(family_id, status, 100)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!(e.to_string())))?;
+    Ok(Json(reminders))
 }
 
 /// Agent 运行状态（不含任何密钥）。

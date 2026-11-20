@@ -262,4 +262,9 @@ pub struct AgentMemory {
     pub content: String,
     pub source: String,
     pub created_at: DateTime<Utc>,
+    /// fact / preference / rule
+    pub kind: String,
+    pub importance: i16,
+    pub reinforced_count: i32,
+    pub last_reinforced_at: Option<DateTime<Utc>>,
 }

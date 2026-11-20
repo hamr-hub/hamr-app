@@ -421,6 +421,9 @@ mod tests {
             timeout: Duration::from_secs(30),
             max_history: 20,
             jiabu_url: None,
+            quiet_start: 22 * 60,
+            quiet_end: 7 * 60 + 30,
+            daily_reminder_cap: 5,
         }
     }
 

@@ -60,6 +60,12 @@ pub struct AgentConfig {
     pub max_history: i64,
     /// JiaBu 决策引擎地址。配置后才会向 Agent 暴露 `jiabu_score` 工具。
     pub jiabu_url: Option<String>,
+    /// 免打扰开始时间（一天中的第几分钟，本地时区）。
+    pub quiet_start: u16,
+    /// 免打扰结束时间（一天中的第几分钟，本地时区，支持跨午夜）。
+    pub quiet_end: u16,
+    /// 每个家庭每天主动提醒条数上限（紧急旁路不受限）。
+    pub daily_reminder_cap: u32,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -76,6 +82,9 @@ impl std::fmt::Debug for AgentConfig {
             .field("timeout", &self.timeout)
             .field("max_history", &self.max_history)
             .field("jiabu_url", &self.jiabu_url)
+            .field("quiet_start", &self.quiet_start)
+            .field("quiet_end", &self.quiet_end)
+            .field("daily_reminder_cap", &self.daily_reminder_cap)
             .finish()
     }
 }
@@ -94,6 +103,9 @@ impl AgentConfig {
             timeout: Duration::from_secs(60),
             max_history: 20,
             jiabu_url: None,
+            quiet_start: 22 * 60,
+            quiet_end: 7 * 60 + 30,
+            daily_reminder_cap: 5,
         }
     }
 
@@ -148,6 +160,11 @@ impl AgentConfig {
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty());
 
+        // 主动提醒：免打扰时段默认 22:00-07:30（家庭夜间安静），每日上限 5 条。
+        let (quiet_start, quiet_end) =
+            parse_quiet_hours(&env_str("HAMR_AGENT_QUIET_HOURS", "22:00-07:30"))?;
+        let daily_reminder_cap = env_int("HAMR_AGENT_DAILY_REMINDER_CAP", 5)?.clamp(0, 50) as u32;
+
         Ok(Self {
             enabled,
             provider,
@@ -159,6 +176,9 @@ impl AgentConfig {
             timeout: Duration::from_secs(timeout_secs),
             max_history,
             jiabu_url,
+            quiet_start,
+            quiet_end,
+            daily_reminder_cap,
         })
     }
 
@@ -196,6 +216,31 @@ fn env_int(key: &str, default: i64) -> anyhow::Result<i64> {
     }
 }
 
+/// 解析 `HH:MM-HH:MM` 免打扰时段为（开始分钟, 结束分钟）。
+fn parse_quiet_hours(raw: &str) -> anyhow::Result<(u16, u16)> {
+    let (start, end) = raw.split_once('-').ok_or_else(|| {
+        anyhow::anyhow!("invalid HAMR_AGENT_QUIET_HOURS (want HH:MM-HH:MM): {raw}")
+    })?;
+    let parse = |part: &str| -> anyhow::Result<u16> {
+        let (h, m) = part.trim().split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("invalid HAMR_AGENT_QUIET_HOURS time (want HH:MM): {part}")
+        })?;
+        let h: u16 = h
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid hour in HAMR_AGENT_QUIET_HOURS: {h}"))?;
+        let m: u16 = m
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid minute in HAMR_AGENT_QUIET_HOURS: {m}"))?;
+        if h > 23 || m > 59 {
+            anyhow::bail!("out-of-range time in HAMR_AGENT_QUIET_HOURS: {part}");
+        }
+        Ok(h * 60 + m)
+    };
+    Ok((parse(start)?, parse(end)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +266,8 @@ mod tests {
             "HAMR_AGENT_TIMEOUT_SECS",
             "HAMR_AGENT_MAX_HISTORY",
             "HAMR_JIABU_URL",
+            "HAMR_AGENT_QUIET_HOURS",
+            "HAMR_AGENT_DAILY_REMINDER_CAP",
         ] {
             std::env::remove_var(k);
         }
@@ -333,5 +380,37 @@ mod tests {
         std::env::set_var("HAMR_JIABU_URL", "http://jiabu:3003/");
         let cfg = AgentConfig::from_env().expect("config with jiabu");
         assert_eq!(cfg.jiabu_url.as_deref(), Some("http://jiabu:3003"));
+    }
+
+    #[test]
+    fn proactive_defaults_are_family_friendly() {
+        let _env = env_guard();
+        clear_env();
+        let cfg = AgentConfig::from_env().expect("config");
+        assert_eq!(cfg.quiet_start, 22 * 60, "默认 22:00 开始免打扰");
+        assert_eq!(cfg.quiet_end, 7 * 60 + 30, "默认 07:30 结束");
+        assert_eq!(cfg.daily_reminder_cap, 5);
+    }
+
+    #[test]
+    fn parses_quiet_hours_cross_midnight() {
+        let (s, e) = parse_quiet_hours("23:00-06:15").unwrap();
+        assert_eq!((s, e), (23 * 60, 6 * 60 + 15));
+    }
+
+    #[test]
+    fn rejects_bad_quiet_hours() {
+        assert!(parse_quiet_hours("22:00").is_err());
+        assert!(parse_quiet_hours("25:00-07:00").is_err());
+        assert!(parse_quiet_hours("22:00-07:60").is_err());
+    }
+
+    #[test]
+    fn daily_cap_is_clamped() {
+        let _env = env_guard();
+        clear_env();
+        std::env::set_var("HAMR_AGENT_DAILY_REMINDER_CAP", "999");
+        let cfg = AgentConfig::from_env().expect("config");
+        assert_eq!(cfg.daily_reminder_cap, 50, "上限应被夹住");
     }
 }

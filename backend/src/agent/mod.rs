@@ -19,11 +19,13 @@
 //! - [`privacy`]  —— PII 脱敏器
 //! - [`prompt`]   —— 管家人格与系统提示词
 //! - [`tools`]    —— 工具定义与执行分发
-//! - [`store`]    —— 会话 / 消息 / 长期记忆的持久化抽象
+//! - [`store`]    —— 会话 / 消息 / 长期记忆 / 提醒的持久化抽象
 //! - [`runner`]   —— 主循环（思考 → 调工具 → 观察 → 结论）
+//! - [`proactive`] —— 主动提醒：三态决策 + 闸门 + 规则扫描
 
 pub mod config;
 pub mod privacy;
+pub mod proactive;
 pub mod prompt;
 pub mod provider;
 pub mod runner;
@@ -32,4 +34,4 @@ pub mod tools;
 
 pub use config::AgentConfig;
 pub use runner::{AgentError, AgentRuntime, AgentStatus, StepTrace};
-pub use store::{AgentMemory, AgentSession, ConversationStore, PgStore};
+pub use store::{AgentMemory, AgentSession, ConversationStore, MemoryKind, PgStore};
