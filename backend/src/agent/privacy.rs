@@ -36,7 +36,7 @@ impl Redactor {
             }
         }
         // 长名优先：否则「张伟」和「张伟伟」这种重叠会替换错。
-        unique.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+        unique.sort_by_key(|a| std::cmp::Reverse(a.chars().count()));
 
         let aliases = unique
             .into_iter()
@@ -52,12 +52,6 @@ impl Redactor {
         Self {
             aliases: Vec::new(),
         }
-    }
-
-    /// 别名映射（供测试与调试查看）。
-    #[cfg(test)]
-    pub fn mappings(&self) -> &[(String, String)] {
-        &self.aliases
     }
 
     /// 对文本脱敏。
@@ -119,7 +113,7 @@ fn alias_letter(i: usize) -> String {
     let mut out = Vec::new();
     let mut n = i;
     loop {
-        out.push(letters.as_bytes()[(n % 26) as usize] as char);
+        out.push(letters.as_bytes()[n % 26] as char);
         if n < 26 {
             break;
         }

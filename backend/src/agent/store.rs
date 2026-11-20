@@ -6,6 +6,7 @@
 //!
 //! 生产用 [`PgStore`]，测试用 [`MemStore`]。
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 #[cfg(test)]
@@ -137,11 +138,20 @@ pub trait ConversationStore: Send + Sync {
         session_id: Option<Uuid>,
     ) -> StoreFuture<'a, Uuid>;
 
-    /// 读取历史消息（按时间正序，最多 limit 条）。
+    /// 读取最近 limit 条消息（按时间正序），跳过不完整的工具组。
     fn history<'a>(&'a self, session_id: Uuid, limit: i64) -> StoreFuture<'a, Vec<ChatMessage>>;
 
     /// 追加一条消息。
-    fn append<'a>(&'a self, session_id: Uuid, msg: &'a ChatMessage) -> StoreFuture<'a, ()>;
+    fn append<'a>(&'a self, session_id: Uuid, msg: &'a ChatMessage) -> StoreFuture<'a, ()> {
+        self.append_batch(session_id, std::slice::from_ref(msg))
+    }
+
+    /// 按给定顺序原子追加一批消息，例如一次工具调用及其所有结果。
+    fn append_batch<'a>(
+        &'a self,
+        session_id: Uuid,
+        messages: &'a [ChatMessage],
+    ) -> StoreFuture<'a, ()>;
 
     /// 列出会话。
     fn list_sessions<'a>(
@@ -250,51 +260,78 @@ impl ConversationStore for PgStore {
 
     fn history<'a>(&'a self, session_id: Uuid, limit: i64) -> StoreFuture<'a, Vec<ChatMessage>> {
         Box::pin(async move {
-            // 取最近 limit 条，再在内存里翻正序 —— 模型的上下文必须是时间正序。
             let rows: Vec<(String, String, Option<serde_json::Value>, Option<String>)> =
                 sqlx::query_as(
                     r#"SELECT role, content, tool_calls, tool_call_id
-                   FROM (
-                       SELECT role, content, tool_calls, tool_call_id, created_at
-                       FROM agent_messages
-                       WHERE session_id = $1
-                       ORDER BY created_at DESC
-                       LIMIT $2
-                   ) t
-                   ORDER BY created_at ASC"#,
+                   FROM agent_messages
+                   WHERE session_id = $1
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT $2"#,
                 )
                 .bind(session_id)
-                .bind(limit)
+                .bind(limit.max(0))
                 .fetch_all(&self.db)
                 .await
                 .map_err(|e| StoreError::Db(e.to_string()))?;
 
-            Ok(rows.into_iter().map(row_to_message).collect())
+            Ok(complete_history(rows.into_iter().rev().map(row_to_message)))
         })
     }
 
-    fn append<'a>(&'a self, session_id: Uuid, msg: &'a ChatMessage) -> StoreFuture<'a, ()> {
+    fn append_batch<'a>(
+        &'a self,
+        session_id: Uuid,
+        messages: &'a [ChatMessage],
+    ) -> StoreFuture<'a, ()> {
         Box::pin(async move {
-            let (role, content, tool_calls, tool_call_id) = message_to_row(msg);
-            sqlx::query(
-                r#"INSERT INTO agent_messages (session_id, role, content, tool_calls, tool_call_id)
-                   VALUES ($1, $2, $3, $4, $5)"#,
-            )
-            .bind(session_id)
-            .bind(role)
-            .bind(content)
-            .bind(tool_calls)
-            .bind(tool_call_id)
-            .execute(&self.db)
-            .await
-            .map_err(|e| StoreError::Db(e.to_string()))?;
-            // 顺带刷新会话的 updated_at，让「最近会话」列表按活跃度排序。
-            sqlx::query("UPDATE agent_sessions SET updated_at = NOW() WHERE id = $1")
-                .bind(session_id)
-                .execute(&self.db)
+            if messages.is_empty() {
+                return Ok(());
+            }
+
+            let mut roles = Vec::with_capacity(messages.len());
+            let mut contents = Vec::with_capacity(messages.len());
+            let mut calls = Vec::with_capacity(messages.len());
+            let mut call_ids = Vec::with_capacity(messages.len());
+            for message in messages {
+                let (role, content, tool_calls, tool_call_id) = message_to_row(message);
+                roles.push(role);
+                contents.push(content);
+                calls.push(tool_calls);
+                call_ids.push(tool_call_id);
+            }
+
+            let mut tx = self
+                .db
+                .begin()
                 .await
                 .map_err(|e| StoreError::Db(e.to_string()))?;
-            Ok(())
+            // 先锁定会话行，同一会话的并发追加不会把消息插入工具组中间。
+            sqlx::query("UPDATE agent_sessions SET updated_at = clock_timestamp() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Db(e.to_string()))?;
+            // 每条消息的时间戳严格递增，历史截断与回放都使用同一个顺序。
+            sqlx::query(
+                r#"INSERT INTO agent_messages (session_id, role, content, tool_calls, tool_call_id, created_at)
+                   SELECT $1, m.role, m.content, m.tool_calls, m.tool_call_id,
+                          p.last_at + m.ordinal * INTERVAL '1 microsecond'
+                   FROM unnest($2::text[], $3::text[], $4::jsonb[], $5::text[])
+                        WITH ORDINALITY AS m(role, content, tool_calls, tool_call_id, ordinal)
+                   CROSS JOIN (
+                       SELECT GREATEST(statement_timestamp(), MAX(created_at)) AS last_at
+                       FROM agent_messages WHERE session_id = $1
+                   ) p"#,
+            )
+            .bind(session_id)
+            .bind(roles)
+            .bind(contents)
+            .bind(calls)
+            .bind(call_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+            tx.commit().await.map_err(|e| StoreError::Db(e.to_string()))
         })
     }
 
@@ -571,13 +608,50 @@ fn row_to_message(row: (String, String, Option<serde_json::Value>, Option<String
     }
 }
 
+/// 只回放连续且每个调用恰好有一个结果的工具组。旧记录和历史截断都可能留下残缺组。
+fn complete_history(messages: impl IntoIterator<Item = ChatMessage>) -> Vec<ChatMessage> {
+    let mut messages = messages.into_iter().peekable();
+    let mut replay = Vec::new();
+    while let Some(mut message) = messages.next() {
+        match &mut message {
+            ChatMessage::Tool { .. } => {}
+            ChatMessage::Assistant { tool_calls, .. } => {
+                let Some(calls) = tool_calls.as_ref().filter(|calls| !calls.is_empty()) else {
+                    *tool_calls = None;
+                    replay.push(message);
+                    continue;
+                };
+                let mut pending: HashSet<_> = calls.iter().map(|call| call.id.as_str()).collect();
+                if pending.len() != calls.len() || pending.iter().any(|id| id.trim().is_empty()) {
+                    continue;
+                }
+                let mut results = Vec::with_capacity(calls.len());
+                while !pending.is_empty() {
+                    let Some(result) = messages.next_if(|next| {
+                        matches!(next, ChatMessage::Tool { tool_call_id, .. } if pending.remove(tool_call_id.as_str()))
+                    }) else {
+                        break;
+                    };
+                    results.push(result);
+                }
+                if pending.is_empty() {
+                    replay.push(message);
+                    replay.extend(results);
+                }
+            }
+            _ => replay.push(message),
+        }
+    }
+    replay
+}
+
 // ===== 内存实现（测试用） =====
 
 #[derive(Default)]
 #[cfg(test)]
 struct MemInner {
     sessions: Vec<AgentSession>,
-    messages: Vec<(Uuid, ChatMessage, DateTime<Utc>)>,
+    messages: Vec<(Uuid, ChatMessage)>,
     memories: Vec<AgentMemory>,
     reminders: Vec<AgentReminder>,
     proactive_log: Vec<ProactiveLogRowEntry>,
@@ -647,23 +721,34 @@ impl ConversationStore for MemStore {
     fn history<'a>(&'a self, session_id: Uuid, limit: i64) -> StoreFuture<'a, Vec<ChatMessage>> {
         Box::pin(async move {
             let g = self.inner.lock().unwrap();
-            let mut msgs: Vec<&(Uuid, ChatMessage, DateTime<Utc>)> = g
+            let recent: Vec<_> = g
                 .messages
                 .iter()
-                .filter(|(sid, _, _)| *sid == session_id)
+                .rev()
+                .filter(|(sid, _)| *sid == session_id)
+                .take(limit.max(0) as usize)
+                .map(|(_, message)| message.clone())
                 .collect();
-            msgs.sort_by_key(|(_, _, ts)| *ts);
-            if limit > 0 && msgs.len() > limit as usize {
-                msgs = msgs.split_off(msgs.len() - limit as usize);
-            }
-            Ok(msgs.into_iter().map(|(_, m, _)| m.clone()).collect())
+            Ok(complete_history(recent.into_iter().rev()))
         })
     }
 
-    fn append<'a>(&'a self, session_id: Uuid, msg: &'a ChatMessage) -> StoreFuture<'a, ()> {
+    fn append_batch<'a>(
+        &'a self,
+        session_id: Uuid,
+        messages: &'a [ChatMessage],
+    ) -> StoreFuture<'a, ()> {
         Box::pin(async move {
+            if messages.is_empty() {
+                return Ok(());
+            }
             let mut g = self.inner.lock().unwrap();
-            g.messages.push((session_id, msg.clone(), Utc::now()));
+            g.messages.extend(
+                messages
+                    .iter()
+                    .cloned()
+                    .map(|message| (session_id, message)),
+            );
             if let Some(s) = g.sessions.iter_mut().find(|s| s.id == session_id) {
                 s.updated_at = Utc::now();
             }
@@ -684,7 +769,7 @@ impl ConversationStore for MemStore {
                 .filter(|s| s.family_id == family_id)
                 .cloned()
                 .collect();
-            out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
             if limit > 0 && out.len() > limit as usize {
                 out.truncate(limit as usize);
             }
@@ -881,7 +966,7 @@ impl ConversationStore for MemStore {
             let mut g = self.inner.lock().unwrap();
             let before = g.sessions.len();
             g.sessions.retain(|s| s.id != session_id);
-            g.messages.retain(|(sid, _, _)| *sid != session_id);
+            g.messages.retain(|(sid, _)| *sid != session_id);
             Ok(g.sessions.len() != before)
         })
     }
@@ -890,7 +975,26 @@ impl ConversationStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::provider::ChatMessage;
+    use crate::agent::provider::{ChatMessage, FunctionCall, ToolCall};
+    use crate::agent::tools::tool_message;
+
+    fn assistant_calls(content: &str, ids: &[&str]) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: content.into(),
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: (*id).into(),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: "list_tasks".into(),
+                            arguments: "{}".into(),
+                        },
+                    })
+                    .collect(),
+            ),
+        }
+    }
 
     #[tokio::test]
     async fn mem_store_creates_and_reuses_sessions() {
@@ -945,6 +1049,67 @@ mod tests {
         assert_eq!(hist.len(), 2);
         assert_eq!(hist[0].text(), "m3", "应保留最近两条");
         assert_eq!(hist[1].text(), "m4");
+    }
+
+    #[tokio::test]
+    async fn mem_store_history_omits_tool_group_cut_by_limit() {
+        let store = MemStore::new();
+        let sid = store
+            .ensure_session(Uuid::new_v4(), None, None)
+            .await
+            .unwrap();
+        store
+            .append_batch(
+                sid,
+                &[
+                    ChatMessage::user("question"),
+                    assistant_calls("calls", &["one", "two"]),
+                    tool_message("one", "result one"),
+                    tool_message("two", "result two"),
+                    ChatMessage::Assistant {
+                        content: "answer".into(),
+                        tool_calls: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        let full = store.history(sid, 4).await.unwrap();
+        let texts: Vec<_> = full.iter().map(ChatMessage::text).collect();
+        assert_eq!(texts, ["calls", "result one", "result two", "answer"]);
+        for limit in 1..4 {
+            let partial = store.history(sid, limit).await.unwrap();
+            assert_eq!(partial.len(), 1);
+            assert_eq!(partial[0].text(), "answer");
+        }
+        assert!(store.history(sid, 0).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn history_drops_incomplete_and_orphaned_legacy_messages() {
+        let rows = [
+            tool_message("missing", "orphan"),
+            assistant_calls("legacy with no results", &["legacy"]),
+            ChatMessage::user("question"),
+            assistant_calls("partial", &["a", "b"]),
+            tool_message("a", "first"),
+            tool_message("a", "duplicated"),
+            tool_message("b", "too late"),
+            assistant_calls("mismatch", &["wrong"]),
+            tool_message("unrelated", "does not match"),
+            assistant_calls("complete", &["a", "b"]),
+            tool_message("a", "result a"),
+            tool_message("b", "result b"),
+            tool_message("extra", "extra orphan"),
+            assistant_calls("unfinished at end", &["tail"]),
+        ]
+        .into_iter()
+        .map(|message| message_to_row(&message));
+
+        let history = complete_history(rows.map(row_to_message));
+        let texts: Vec<_> = history.iter().map(ChatMessage::text).collect();
+        assert_eq!(texts, ["question", "complete", "result a", "result b"]);
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ use super::provider::{ChatMessage, ChatRequest, LlmProvider, ToolCall};
 const PROBE_MARKER: &str = "紫罗兰纪念日";
 
 /// 体检用的问法。
-const PROBE_QUESTION: &str = "我明天有什么安排？请查询一下家庭的日程安排再回答。";
+const PROBE_QUESTION: &str = "家庭日程里有哪些安排？请查询日程，并原样列出返回的日程标题。";
 
 /// 体检结果。
 #[derive(Clone, Debug, Serialize)]
@@ -192,7 +192,7 @@ pub async fn probe(provider: &dyn LlmProvider) -> ProbeResult {
     }
 
     // --- 第二题：会不会用工具结果 ---
-    let mut messages = vec![
+    let messages = vec![
         ChatMessage::system("你是一个用于测试的家庭管家助手。回答前需要数据时必须调用提供的工具。"),
         ChatMessage::user(PROBE_QUESTION),
         ChatMessage::Assistant {
@@ -204,7 +204,6 @@ pub async fn probe(provider: &dyn LlmProvider) -> ProbeResult {
             tool_call_id: call.id.clone(),
         },
     ];
-    messages.push(ChatMessage::user("好的，请基于上面的查询结果直接回答我的问题。"));
 
     let second = match provider
         .chat(ChatRequest {

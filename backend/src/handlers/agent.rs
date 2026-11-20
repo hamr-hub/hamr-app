@@ -3,11 +3,12 @@
 //! 全部挂在 `auth_middleware` 之后 —— 管家数据是家庭隐私，
 //! Agent 能读到的数据不比直接调 API 少，所以鉴权级别必须一致。
 //!
-//! Agent 未启用（`HAMR_AGENT_ENABLED` 未开启）时统一返回 503，
-//! 而不是伪装成「助手暂时不可用」—— 让运维一眼看出是没开而不是挂了。
+//! 鉴权成功后，Agent 子路由统一检查运行时是否可用，缺失时返回 503。
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
+    middleware::Next,
+    response::Response,
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,15 @@ fn runtime(state: &AppState) -> AppResult<&AgentRuntime> {
         .agent
         .as_deref()
         .ok_or_else(|| AppError::AgentUnavailable("agent runtime is not enabled".into()))
+}
+
+pub(crate) async fn require_runtime(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> AppResult<Response> {
+    runtime(&state)?;
+    Ok(next.run(req).await)
 }
 
 /// 把 Agent 内部错误映射成 HTTP 语义。
@@ -369,13 +379,9 @@ pub async fn scan_skills(
     Extension(_claims): Extension<Claims>,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<serde_json::Value>>> {
-    let root = state
-        .agent
-        .as_deref()
-        .map(|rt| rt.skills_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("skills"));
+    let root = runtime(&state)?.skills_dir();
     Ok(Json(
-        crate::agent::skills::scan_disk(&root)
+        crate::agent::skills::scan_disk(root)
             .into_iter()
             .map(|(skill_id, version, path)| {
                 serde_json::json!({ "skill_id": skill_id, "version": version, "path": path })
@@ -399,15 +405,11 @@ pub async fn install_skill(
     State(state): State<AppState>,
     Json(req): Json<InstallSkillRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let root = state
-        .agent
-        .as_deref()
-        .map(|rt| rt.skills_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("skills"));
+    let root = runtime(&state)?.skills_dir();
     let row = crate::agent::skills::install(
         &state.db,
         req.family_id,
-        &root,
+        root,
         &req.skill_id,
         &req.version,
         req.enabled,
@@ -477,6 +479,10 @@ pub async fn confirm_write_op(
     Path(operation_id): Path<Uuid>,
     Json(req): Json<WriteOpRequest>,
 ) -> AppResult<Json<crate::agent::writeops::WriteOp>> {
+    // 当前服务端开关也约束已排队的提议，在读取或修改审批记录前检查。
+    if !state.config.agent.allow_write {
+        return Err(AppError::Forbidden);
+    }
     let op = crate::agent::writeops::confirm(&state.db, req.family_id, operation_id)
         .await
         .map_err(AppError::ValidationError)?;
@@ -514,7 +520,8 @@ fn require_family(params: &HashMap<String, String>) -> AppResult<Uuid> {
         .ok_or_else(|| AppError::ValidationError("family_id required".into()))
 }
 
-/// Agent 运行状态（不含任何密钥）。
+/// 供 Agent 就绪检查使用。运行时可用时返回 200 和运行信息，缺失时返回 503。
+/// 响应不含任何密钥。
 pub async fn status(
     Extension(_claims): Extension<Claims>,
     State(state): State<AppState>,

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { isAxiosError } from 'axios'
 import { motion } from 'framer-motion'
 import { Plus, Trash2, User, Phone, Mail, Tag } from 'lucide-react'
 import { useAppStore, type Person } from '../store'
@@ -7,14 +8,26 @@ export default function PeoplePage() {
   const { people, fetchPeople, createPerson, deletePerson, familyId } = useAppStore()
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({ name: '', role: '', phone: '', email: '', birthday: '', notes: '' })
+  const [createError, setCreateError] = useState('')
+  const [isCreating, setIsCreating] = useState(false)
+  const formMessage = familyId ? createError : '请先在账号中心选择或创建家庭'
 
   useEffect(() => { if (familyId) fetchPeople() }, [familyId, fetchPeople])
 
   const handleCreate = async () => {
-    if (!form.name.trim()) return
-    await createPerson({ name: form.name, role: form.role || undefined, phone: form.phone || undefined, email: form.email || undefined, birthday: form.birthday || undefined, notes: form.notes || undefined })
-    setForm({ name: '', role: '', phone: '', email: '', birthday: '', notes: '' })
-    setShowForm(false)
+    if (!familyId || !form.name.trim() || isCreating) return
+    setIsCreating(true)
+    setCreateError('')
+    try {
+      await createPerson({ name: form.name, role: form.role || undefined, phone: form.phone || undefined, email: form.email || undefined, birthday: form.birthday || undefined, notes: form.notes || undefined })
+      setForm({ name: '', role: '', phone: '', email: '', birthday: '', notes: '' })
+      setShowForm(false)
+    } catch (error) {
+      const detail = isAxiosError<{ error?: unknown }>(error) ? error.response?.data?.error : undefined
+      setCreateError(typeof detail === 'string' && detail.trim() ? `添加成员失败：${detail}` : '添加成员失败，请重试')
+    } finally {
+      setIsCreating(false)
+    }
   }
 
   const roleColors: Record<string, string> = {
@@ -40,7 +53,7 @@ export default function PeoplePage() {
       {showForm && (
         <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="card border-primary-200 mb-6">
           <h3 className="font-semibold mb-4 text-slate-900">添加家庭成员</h3>
-          <div className="grid grid-cols-2 gap-3">
+          <fieldset disabled={isCreating} className="grid grid-cols-2 gap-3">
             <div>
               <label className="label">姓名 *</label>
               <input className="input-field" value={form.name} onChange={(e) => setForm(p => ({ ...p, name: e.target.value }))} placeholder="成员姓名" />
@@ -68,10 +81,13 @@ export default function PeoplePage() {
               <label className="label">备注</label>
               <input className="input-field" value={form.notes} onChange={(e) => setForm(p => ({ ...p, notes: e.target.value }))} placeholder="备注信息" />
             </div>
-          </div>
+          </fieldset>
+          {formMessage && <p role="alert" className="mt-3 text-sm text-red-700">{formMessage}</p>}
           <div className="flex space-x-2 mt-4">
-            <button onClick={handleCreate} className="btn-primary">确认添加</button>
-            <button onClick={() => setShowForm(false)} className="btn-secondary">取消</button>
+            <button onClick={handleCreate} disabled={!familyId || isCreating} className="btn-primary">
+              {isCreating ? '添加中…' : '确认添加'}
+            </button>
+            <button onClick={() => setShowForm(false)} disabled={isCreating} className="btn-secondary">取消</button>
           </div>
         </motion.div>
       )}

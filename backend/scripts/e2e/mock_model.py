@@ -45,7 +45,33 @@ def _last_user_text(messages: list) -> str:
 
 
 def _tool_results(messages: list) -> list:
-    return [m.get("content") or "" for m in messages if m.get("role") == "tool"]
+    results = []
+    for message in messages:
+        if message.get("role") == "user":
+            results.clear()
+        elif message.get("role") == "tool":
+            results.append(message.get("content") or "")
+    return results
+
+
+def _valid_tool_transcript(messages: list) -> bool:
+    pending = set()
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            if call_id not in pending:
+                return False
+            pending.remove(call_id)
+        else:
+            if pending:
+                return False
+            if role == "assistant":
+                calls = message.get("tool_calls") or []
+                pending = {call.get("id") for call in calls}
+                if None in pending or "" in pending or len(pending) != len(calls):
+                    return False
+    return not pending
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -61,8 +87,24 @@ class Handler(BaseHTTPRequestHandler):
             req = {}
 
         messages = req.get("messages") or []
+        if not _valid_tool_transcript(messages):
+            self.send_error(400, "Unmatched or incomplete tool call group")
+            return
         tools = {t.get("function", {}).get("name") for t in (req.get("tools") or [])}
         user_text = _last_user_text(messages)
+        if "续聊验证" in user_text:
+            # 上一轮的提议结果必须随历史一起回放，否则模型无从知道待办是什么。
+            last_user = max(
+                index for index, message in enumerate(messages) if message.get("role") == "user"
+            )
+            previous = [
+                message.get("content") or ""
+                for message in messages[:last_user]
+                if message.get("role") == "tool"
+            ]
+            if not any("E2E 交物业费" in content for content in previous):
+                self.send_error(400, "Expected previous proposal tool result in resumed conversation")
+                return
         results = _tool_results(messages)
 
         tool_calls = []

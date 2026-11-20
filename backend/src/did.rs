@@ -139,6 +139,7 @@ impl DeviceIdentity {
 }
 
 /// 经过 DID 签名的消息结构
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedMessage {
     pub device_id: String,
@@ -147,6 +148,7 @@ pub struct SignedMessage {
     pub signature: String,
 }
 
+#[cfg(test)]
 impl SignedMessage {
     pub fn new(
         device_id: String,

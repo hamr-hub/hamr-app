@@ -374,11 +374,6 @@ impl StubProvider {
         self.redacts_pii = redacts_pii;
         self
     }
-
-    /// 取走（并清空）已收到的请求。
-    pub fn take_calls(&self) -> Vec<ChatRequest> {
-        std::mem::take(&mut *self.calls.lock().unwrap())
-    }
 }
 
 #[cfg(test)]

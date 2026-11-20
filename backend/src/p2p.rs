@@ -734,15 +734,6 @@ impl P2PNode {
         })
     }
 
-    /// 返回 Arc 引用，供 API handler 克隆后查询
-    pub fn peers_handle(&self) -> Arc<RwLock<HashMap<String, PeerInfo>>> {
-        self.peers.clone()
-    }
-
-    pub fn listen_addresses_handle(&self) -> Arc<RwLock<Vec<String>>> {
-        self.listen_addresses.clone()
-    }
-
     /// 启动事件循环
     ///
     /// - `sync_rx`：接收来自业务层的 SyncMessage 并广播

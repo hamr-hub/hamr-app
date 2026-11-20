@@ -22,6 +22,7 @@
 //! 2. **脱敏发生在出网那一刻**：库里存原文，模型看到的是脱敏后的内容。
 //! 3. **工具失败不中断整轮**：失败信息回喂给模型，让它自己决定怎么办。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -228,12 +229,10 @@ impl AgentRuntime {
         // 脱敏器要用当前家庭的成员名单来建立「姓名 → 别名」的一致映射。
         let redactor = self.build_redactor(family_id).await;
         let needs_redaction = self.config.needs_redaction();
-
-        // 出网副本：云端且未放开 PII 时脱敏。库里存的仍是原文。
         let mut wire = if needs_redaction {
             redactor.redact_messages(&messages)
         } else {
-            messages.clone()
+            messages
         };
 
         // 工具面：默认工具集 +（若历史里加载过场景包）按其白名单收敛。
@@ -265,54 +264,59 @@ impl AgentRuntime {
             };
             let resp = self.provider.chat(req).await?;
 
-            let assistant = ChatMessage::Assistant {
-                content: resp.content.clone(),
-                tool_calls: if resp.tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(resp.tool_calls.clone())
-                },
-            };
-            self.store.append(session_id, &assistant).await?;
-
             if resp.tool_calls.is_empty() {
-                final_reply = resp.content.trim().to_string();
+                let content = resp.content.trim();
+                let (reply, summary) = if content.is_empty() {
+                    (prompt::FALLBACK_REPLY, "模型未返回文本，使用兜底回复")
+                } else {
+                    (content, "给出结论")
+                };
+                final_reply = reply.to_string();
                 steps.push(StepTrace {
                     step,
                     tool: None,
-                    summary: "给出结论".to_string(),
+                    summary: summary.to_string(),
                 });
                 break;
             }
 
-            for tc in &resp.tool_calls {
+            let mut calls = resp.tool_calls;
+            let mut call_ids = HashSet::new();
+            for call in &mut calls {
+                // 兼容省略或复用调用 ID 的模型，每个结果都需要唯一的对应 ID。
+                while call.id.trim().is_empty() || !call_ids.insert(call.id.clone()) {
+                    call.id = format!("call_{}", Uuid::new_v4().simple());
+                }
+            }
+            let mut group = Vec::with_capacity(1 + calls.len());
+            group.push(ChatMessage::Assistant {
+                content: resp.content,
+                tool_calls: Some(calls.clone()),
+            });
+            for tc in calls {
                 tool_calls += 1;
-                let raw_args = if tc.function.arguments.trim().is_empty() {
-                    "{}"
-                } else {
-                    tc.function.arguments.as_str()
-                };
                 // 工具失败不中断整轮 —— 把失败原因回喂给模型，它自己决定换路。
-                let content = match tools::dispatch(&ctx, &tc.function.name, raw_args).await {
-                    Ok(v) => v,
-                    Err(e) => format!("工具执行失败：{e}"),
-                };
-                let wire_content = if needs_redaction {
-                    redactor.redact(&content)
-                } else {
-                    content.clone()
-                };
-                wire.push(tools::tool_message(&tc.id, &wire_content));
+                let content =
+                    match tools::dispatch(&ctx, &tc.function.name, &tc.function.arguments).await {
+                        Ok(v) => v,
+                        Err(e) => format!("工具执行失败：{e}"),
+                    };
+                group.push(tools::tool_message(&tc.id, &content));
                 steps.push(StepTrace {
                     step,
-                    tool: Some(tc.function.name.clone()),
+                    tool: Some(tc.function.name),
                     summary: summarize(&content),
                 });
+            }
+            self.store.append_batch(session_id, &group).await?;
+            if needs_redaction {
+                wire.extend(redactor.redact_messages(&group));
+            } else {
+                wire.extend(group);
             }
         }
 
         if final_reply.is_empty() {
-            // 步数用完还没出结论 —— 给一句能用的兜底，而不是空白。
             final_reply = prompt::FALLBACK_REPLY.to_string();
             steps.push(StepTrace {
                 step: self.config.max_steps,
@@ -320,6 +324,15 @@ impl AgentRuntime {
                 summary: "达到步数上限，使用兜底回复".to_string(),
             });
         }
+        self.store
+            .append(
+                session_id,
+                &ChatMessage::Assistant {
+                    content: final_reply.clone(),
+                    tool_calls: None,
+                },
+            )
+            .await?;
 
         Ok(AgentOutcome {
             session_id,
@@ -528,40 +541,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_tool_then_answers() {
+    async fn sends_and_replays_multiple_tool_results_in_order() {
         let provider = Arc::new(StubProvider::new(vec![
             ChatResponse {
-                content: String::new(),
-                tool_calls: vec![tool_call("c1", "list_tasks", "{}")],
+                content: "我来记一下".into(),
+                tool_calls: vec![
+                    tool_call("c1", "remember", r#"{"content":"喜欢喝茶"}"#),
+                    tool_call("c2", "not_a_tool", "{}"),
+                    tool_call("c3", "remember", "{"),
+                ],
                 finish_reason: Some("tool_calls".into()),
             },
-            ChatResponse::final_text("还有 3 件待办没完成。"),
+            ChatResponse::final_text("  已记住。  "),
+            ChatResponse::final_text("你喜欢喝茶。"),
         ]));
-        let rt = runtime(provider, config());
+        let rt = runtime(provider.clone(), config());
+        let family_id = Uuid::new_v4();
         let out = rt
-            .run(Uuid::new_v4(), None, "我还有什么事没做", None)
+            .run(family_id, None, "记住我喜欢喝茶", None)
             .await
             .unwrap();
-        assert_eq!(out.reply, "还有 3 件待办没完成。");
-        assert_eq!(out.tool_calls, 1);
-        assert_eq!(out.steps[0].tool.as_deref(), Some("list_tasks"));
-        assert!(out.steps[1].tool.is_none());
+        assert_eq!(out.reply, "已记住。");
+        assert_eq!(out.tool_calls, 3);
+        let history = rt.store.history(out.session_id, 20).await.unwrap();
+        assert_eq!(history.len(), 6);
+        assert!(
+            matches!(history.last(), Some(ChatMessage::Assistant { content, tool_calls: None }) if content == &out.reply)
+        );
+
+        let continued = rt
+            .run(family_id, None, "我喜欢什么", Some(out.session_id))
+            .await
+            .unwrap();
+        assert_eq!(continued.session_id, out.session_id);
+        assert_eq!(continued.reply, "你喜欢喝茶。");
+
+        let requests = provider.calls.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let followup = &requests[1].messages;
+        assert_eq!(followup.len(), 6);
+        let ChatMessage::Assistant {
+            content,
+            tool_calls: Some(calls),
+        } = &followup[2]
+        else {
+            panic!("工具结果之前必须有 assistant 工具调用消息");
+        };
+        assert_eq!(content, "我来记一下");
+        assert_eq!(calls.len(), 3);
+        for (index, (id, expected)) in [
+            ("c1", r#""ok":true"#),
+            ("c2", "工具执行失败：unknown tool"),
+            ("c3", "工具执行失败：invalid tool arguments"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(calls[index].id, id);
+            assert!(
+                matches!(&followup[index + 3], ChatMessage::Tool { tool_call_id, content } if tool_call_id == id && content.contains(expected))
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&followup[1..]).unwrap(),
+            serde_json::to_value(&history[..5]).unwrap()
+        );
+        assert_eq!(requests[2].messages.len(), 8);
+        assert_eq!(
+            serde_json::to_value(&requests[2].messages[1..7]).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+        assert_eq!(requests[2].messages[7].text(), "我喜欢什么");
     }
 
     #[tokio::test]
-    async fn tool_failure_does_not_break_the_turn() {
+    async fn fills_missing_and_duplicate_call_ids() {
         let provider = Arc::new(StubProvider::new(vec![
             ChatResponse {
                 content: String::new(),
-                tool_calls: vec![tool_call("c1", "not_a_tool", "{}")],
+                tool_calls: vec![
+                    tool_call("c1", "not_a_tool", "{}"),
+                    tool_call("", "not_a_tool", "{}"),
+                    tool_call("c1", "not_a_tool", "{}"),
+                ],
                 finish_reason: Some("tool_calls".into()),
             },
-            ChatResponse::final_text("工具那边出了点问题，我先按现有信息回答。"),
+            ChatResponse::final_text("工具未找到。"),
         ]));
-        let rt = runtime(provider, config());
-        let out = rt.run(Uuid::new_v4(), None,"随便问问", None).await.unwrap();
-        assert!(out.reply.contains("出了点问题"));
-        assert_eq!(out.tool_calls, 1);
+        let rt = runtime(provider.clone(), config());
+        let out = rt
+            .run(Uuid::new_v4(), None, "随便问问", None)
+            .await
+            .unwrap();
+        let history = rt.store.history(out.session_id, 20).await.unwrap();
+        let requests = provider.calls.lock().unwrap();
+        let group = &requests[1].messages[2..];
+        let ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = &group[0]
+        else {
+            panic!("缺少工具调用消息");
+        };
+        let ids: HashSet<_> = calls.iter().map(|call| call.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains(""));
+        assert_eq!(calls[0].id, "c1");
+        for (call, result) in calls.iter().zip(&group[1..]) {
+            assert!(
+                matches!(result, ChatMessage::Tool { tool_call_id, .. } if tool_call_id == &call.id)
+            );
+        }
+        assert_eq!(history.len(), 6);
+        assert_eq!(
+            serde_json::to_value(&history[1..5]).unwrap(),
+            serde_json::to_value(group).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -570,7 +665,7 @@ mod tests {
         let responses: Vec<ChatResponse> = (0..10)
             .map(|i| ChatResponse {
                 content: String::new(),
-                tool_calls: vec![tool_call(&format!("c{i}"), "list_people", "{}")],
+                tool_calls: vec![tool_call(&format!("c{i}"), "not_a_tool", "{}")],
                 finish_reason: Some("tool_calls".into()),
             })
             .collect();
@@ -578,9 +673,37 @@ mod tests {
         let mut cfg = config();
         cfg.max_steps = 3;
         let rt = runtime(provider, cfg);
-        let out = rt.run(Uuid::new_v4(), None,"无限循环", None).await.unwrap();
+        let out = rt
+            .run(Uuid::new_v4(), None, "无限循环", None)
+            .await
+            .unwrap();
         assert_eq!(out.tool_calls, 3, "工具调用次数应受 max_steps 限制");
         assert_eq!(out.reply, prompt::FALLBACK_REPLY);
+        let history = rt.store.history(out.session_id, 20).await.unwrap();
+        assert_eq!(history.len(), 8);
+        assert!(
+            matches!(history.last(), Some(ChatMessage::Assistant { content, tool_calls: None }) if content == prompt::FALLBACK_REPLY)
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.text() == prompt::FALLBACK_REPLY)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_fallback_instead_of_blank_reply() {
+        let provider = Arc::new(StubProvider::new(vec![ChatResponse::final_text(" \n ")]));
+        let rt = runtime(provider, config());
+        let out = rt.run(Uuid::new_v4(), None, "你好", None).await.unwrap();
+        assert_eq!(out.reply, prompt::FALLBACK_REPLY);
+        assert_eq!(out.steps.len(), 1);
+        let history = rt.store.history(out.session_id, 20).await.unwrap();
+        assert!(
+            matches!(history.as_slice(), [ChatMessage::User { .. }, ChatMessage::Assistant { content, tool_calls: None }] if content == prompt::FALLBACK_REPLY)
+        );
     }
 
     #[tokio::test]
@@ -618,18 +741,55 @@ mod tests {
     #[tokio::test]
     async fn cloud_provider_redacts_wire_payload() {
         let provider = Arc::new(
-            StubProvider::new(vec![ChatResponse::final_text("好的")])
-                .with_kind(super::super::config::ProviderKind::Cloud, true),
+            StubProvider::new(vec![
+                ChatResponse {
+                    content: "检查 a@b.cn".into(),
+                    tool_calls: vec![tool_call("new", "not_a_tool", "{}")],
+                    finish_reason: Some("tool_calls".into()),
+                },
+                ChatResponse::final_text("好的"),
+            ])
+            .with_kind(super::super::config::ProviderKind::Cloud, true),
         );
         let mut cfg = config();
         cfg.provider = super::super::config::ProviderKind::Cloud;
         cfg.allow_pii = false;
-        let rt = runtime(provider, cfg);
-        let out = rt
-            .run(Uuid::new_v4(), None, "我的邮箱是 a@b.cn", None)
+        let rt = runtime(provider.clone(), cfg);
+        let family_id = Uuid::new_v4();
+        let session_id = rt
+            .store
+            .ensure_session(family_id, None, None)
             .await
             .unwrap();
-        assert!(out.redacted, "云端 + 未放开 PII 时应标记为脱敏");
+        rt.store
+            .append_batch(
+                session_id,
+                &[
+                    ChatMessage::Assistant {
+                        content: String::new(),
+                        tool_calls: Some(vec![tool_call("old", "list_people", "{}")]),
+                    },
+                    tools::tool_message("old", r#"{"email":"a@b.cn"}"#),
+                ],
+            )
+            .await
+            .unwrap();
+        let out = rt
+            .run(family_id, None, "我的邮箱是 a@b.cn", Some(session_id))
+            .await
+            .unwrap();
+        assert!(out.redacted);
+        let history = rt.store.history(session_id, 20).await.unwrap();
+        assert_eq!(history[1].text(), r#"{"email":"a@b.cn"}"#);
+        assert_eq!(history[2].text(), "我的邮箱是 a@b.cn");
+        assert_eq!(history[3].text(), "检查 a@b.cn");
+        let requests = provider.calls.lock().unwrap();
+        let wire = &requests[1].messages;
+        assert!(
+            matches!(&wire[2], ChatMessage::Tool { tool_call_id, content } if tool_call_id == "old" && content.contains("[邮箱已隐藏]"))
+        );
+        assert_eq!(wire[3].text(), "我的邮箱是 [邮箱已隐藏]");
+        assert_eq!(wire[4].text(), "检查 [邮箱已隐藏]");
     }
 
     #[tokio::test]

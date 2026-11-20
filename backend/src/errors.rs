@@ -6,10 +6,12 @@ use thiserror::Error;
 pub enum AppError {
     #[error("Unauthorized")]
     Unauthorized,
+    #[allow(dead_code)] // Reserved for authorization failures.
     #[error("Forbidden")]
     Forbidden,
     #[error("Not found")]
     NotFound,
+    #[allow(dead_code)] // Reserved for resource conflicts.
     #[error("Conflict: {0}")]
     Conflict(String),
     #[error("Validation error: {0}")]

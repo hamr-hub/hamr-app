@@ -16,6 +16,27 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
+  frontend:
+    name: Frontend (lint / build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
   rust:
     name: Rust (cargo check / test / clippy)
     runs-on: ubuntu-latest
@@ -54,6 +75,9 @@ jobs:
       - name: cargo test --offline
         working-directory: backend
         run: cargo test --offline --all-targets
+
+      - name: Agent integration (PostgreSQL + mock model)
+        run: bash backend/scripts/e2e/run.sh
 
       # ── Step 4: clippy 静态分析（offline） ─────────────────────
       # -D warnings 把警告当错误，避免后续 round 累积技术债

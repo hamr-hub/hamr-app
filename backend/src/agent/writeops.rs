@@ -17,7 +17,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 /// 写操作种类。
@@ -36,8 +36,6 @@ pub mod status {
     pub const CONFIRMED: &str = "confirmed";
     /// 已被否决。
     pub const REJECTED: &str = "rejected";
-    /// 落库失败。
-    pub const FAILED: &str = "failed";
     /// 提议挂太久已作废。
     pub const EXPIRED: &str = "expired";
 }
@@ -257,52 +255,75 @@ pub async fn propose(
     Ok(row_to_op(row))
 }
 
-/// 确认一次写操作 —— 真正落库。幂等。
-pub async fn confirm(
-    db: &PgPool,
+async fn lock_op(
+    tx: &mut Transaction<'_, Postgres>,
     family_id: Uuid,
     operation_id: Uuid,
 ) -> Result<WriteOp, String> {
-    let row = sqlx::query_as::<_, WriteOpRow>(
-        &format!("SELECT {SELECT_COLS} FROM agent_write_ops WHERE operation_id = $1 AND family_id = $2")
-    )
+    sqlx::query_as::<_, WriteOpRow>(&format!(
+        "SELECT {SELECT_COLS} FROM agent_write_ops
+         WHERE operation_id = $1 AND family_id = $2 FOR UPDATE"
+    ))
     .bind(operation_id)
     .bind(family_id)
-    .fetch_optional(db)
+    .fetch_optional(&mut **tx)
     .await
-    .map_err(|e| format!("write op lookup failed: {e}"))?;
+    .map_err(|e| format!("write op lookup failed: {e}"))?
+    .map(row_to_op)
+    .ok_or_else(|| format!("write op not found: {operation_id}"))
+}
 
-    let Some(row) = row else {
-        return Err(format!("write op not found: {operation_id}"));
-    };
-    let op = row_to_op(row);
+async fn commit_transition(
+    mut tx: Transaction<'_, Postgres>,
+    op: &WriteOp,
+    new_status: &str,
+    result: Option<&Value>,
+) -> Result<WriteOp, String> {
+    let updated = sqlx::query_as::<_, WriteOpRow>(&format!(
+        "UPDATE agent_write_ops
+         SET status = $3, result = COALESCE($4, result), updated_at = NOW()
+         WHERE operation_id = $1 AND family_id = $2 AND status = $5
+         RETURNING {SELECT_COLS}"
+    ))
+    .bind(op.operation_id)
+    .bind(op.family_id)
+    .bind(new_status)
+    .bind(result)
+    .bind(status::PROPOSED)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| format!("write op transition to {new_status} failed: {e}"))?;
 
-    // 幂等：已确认过就直接返回原结果，不重复写业务表
-    if op.status == status::CONFIRMED {
-        return Ok(op);
-    }
-    if op.status == status::REJECTED {
-        return Err("write op was already rejected".to_string());
-    }
-    if op.status != status::PROPOSED {
-        return Err(format!("write op is not confirmable (status={})", op.status));
-    }
-
-    // 过期：提议挂着太久就不再是「刚才那件事」了 —— 确认它等于替用户做了一个
-    // 早就过期的决定。过期就作废，不落库。
-    if op.created_at < Utc::now() - chrono::Duration::days(MAX_PROPOSAL_AGE_DAYS) {
-        sqlx::query(
-            "UPDATE agent_write_ops SET status = $2, updated_at = NOW() WHERE operation_id = $1",
-        )
-        .bind(operation_id)
-        .bind(status::EXPIRED)
-        .execute(db)
+    tx.commit()
         .await
-        .map_err(|e| format!("write op expire failed: {e}"))?;
+        .map_err(|e| format!("write op commit failed: {e}"))?;
+    Ok(row_to_op(updated))
+}
+
+/// 确认一次写操作 —— 真正落库。幂等。
+pub async fn confirm(db: &PgPool, family_id: Uuid, operation_id: Uuid) -> Result<WriteOp, String> {
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("write op transaction failed: {e}"))?;
+    let op = lock_op(&mut tx, family_id, operation_id).await?;
+
+    match op.status.as_str() {
+        status::CONFIRMED => return Ok(op),
+        status::REJECTED => return Err("write op was already rejected".to_string()),
+        status::PROPOSED => {}
+        other => return Err(format!("write op is not confirmable (status={other})")),
+    }
+
+    // 过期是终态，提交后再向调用方返回错误。
+    if op.created_at < Utc::now() - chrono::Duration::days(MAX_PROPOSAL_AGE_DAYS) {
+        commit_transition(tx, &op, status::EXPIRED, None).await?;
         return Err(format!(
             "write op expired (older than {MAX_PROPOSAL_AGE_DAYS} days): {operation_id}"
         ));
     }
+
+    // 业务数据与审批状态使用同一事务，提前返回时 SQLx 会回滚。
 
     let result = match op.kind.as_str() {
         kind::CREATE_TASK => {
@@ -318,7 +339,7 @@ pub async fn confirm(
             .bind(p.due_date)
             .bind(p.assigned_to)
             .bind(op.member_id)
-            .fetch_one(db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| format!("create task failed: {e}"))?;
             serde_json::json!({ "id": id, "title": p.title })
@@ -336,58 +357,30 @@ pub async fn confirm(
             .bind(p.end_time)
             .bind(&p.location)
             .bind(p.all_day.unwrap_or(false))
-            .fetch_one(db)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| format!("create event failed: {e}"))?;
             serde_json::json!({ "id": id, "title": p.title })
         }
-        other => {
-            let _ = sqlx::query(
-                "UPDATE agent_write_ops SET status = $2, updated_at = NOW() WHERE operation_id = $1",
-            )
-            .bind(operation_id)
-            .bind(status::FAILED)
-            .execute(db)
-            .await;
-            return Err(format!("unsupported write op kind: {other}"));
-        }
+        other => return Err(format!("unsupported write op kind: {other}")),
     };
 
-    let updated = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, Value, String, String, Option<Value>, DateTime<Utc>, DateTime<Utc>)>(
-        &format!("UPDATE agent_write_ops SET status = $2, result = $3, updated_at = NOW()
-                  WHERE operation_id = $1 RETURNING {SELECT_COLS}")
-    )
-    .bind(operation_id)
-    .bind(status::CONFIRMED)
-    .bind(&result)
-    .fetch_one(db)
-    .await
-    .map_err(|e| format!("write op confirm update failed: {e}"))?;
-
-    Ok(row_to_op(updated))
+    commit_transition(tx, &op, status::CONFIRMED, Some(&result)).await
 }
 
-/// 否决一次写操作。
-pub async fn reject(
-    db: &PgPool,
-    family_id: Uuid,
-    operation_id: Uuid,
-) -> Result<WriteOp, String> {
-    let updated = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, Value, String, String, Option<Value>, DateTime<Utc>, DateTime<Utc>)>(
-        &format!("UPDATE agent_write_ops SET status = $3, updated_at = NOW()
-                  WHERE operation_id = $1 AND family_id = $2
-                  RETURNING {SELECT_COLS}")
-    )
-    .bind(operation_id)
-    .bind(family_id)
-    .bind(status::REJECTED)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| format!("write op reject failed: {e}"))?;
+/// 否决一次写操作。幂等。
+pub async fn reject(db: &PgPool, family_id: Uuid, operation_id: Uuid) -> Result<WriteOp, String> {
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| format!("write op transaction failed: {e}"))?;
+    let op = lock_op(&mut tx, family_id, operation_id).await?;
 
-    updated
-        .map(row_to_op)
-        .ok_or_else(|| format!("write op not found: {operation_id}"))
+    match op.status.as_str() {
+        status::REJECTED => Ok(op),
+        status::PROPOSED => commit_transition(tx, &op, status::REJECTED, None).await,
+        other => Err(format!("write op is not rejectable (status={other})")),
+    }
 }
 
 /// 列出写操作。
@@ -397,31 +390,30 @@ pub async fn list_ops(
     status_filter: Option<&str>,
     limit: i64,
 ) -> Result<Vec<WriteOp>, String> {
-    let rows: Vec<WriteOpRow> =
-        match status_filter {
-            Some(s) => {
-                sqlx::query_as(&format!(
-                    "SELECT {SELECT_COLS} FROM agent_write_ops
+    let rows: Vec<WriteOpRow> = match status_filter {
+        Some(s) => {
+            sqlx::query_as(&format!(
+                "SELECT {SELECT_COLS} FROM agent_write_ops
                      WHERE family_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3"
-                ))
-                .bind(family_id)
-                .bind(s)
-                .bind(limit)
-                .fetch_all(db)
-                .await
-            }
-            None => {
-                sqlx::query_as(&format!(
-                    "SELECT {SELECT_COLS} FROM agent_write_ops
-                     WHERE family_id = $1 ORDER BY created_at DESC LIMIT $2"
-                ))
-                .bind(family_id)
-                .bind(limit)
-                .fetch_all(db)
-                .await
-            }
+            ))
+            .bind(family_id)
+            .bind(s)
+            .bind(limit)
+            .fetch_all(db)
+            .await
         }
-        .map_err(|e| format!("write op list failed: {e}"))?;
+        None => {
+            sqlx::query_as(&format!(
+                "SELECT {SELECT_COLS} FROM agent_write_ops
+                     WHERE family_id = $1 ORDER BY created_at DESC LIMIT $2"
+            ))
+            .bind(family_id)
+            .bind(limit)
+            .fetch_all(db)
+            .await
+        }
+    }
+    .map_err(|e| format!("write op list failed: {e}"))?;
 
     Ok(rows.into_iter().map(row_to_op).collect())
 }
@@ -441,7 +433,11 @@ mod tests {
     fn task_payload_rejects_bad_priority() {
         assert!(parse_task_payload(&json!({"title": "x", "priority": "urgentish"})).is_err());
         let p = parse_task_payload(&json!({"title": "x"})).unwrap();
-        assert_eq!(p.priority.as_deref(), Some("medium"), "未指定时取默认优先级");
+        assert_eq!(
+            p.priority.as_deref(),
+            Some("medium"),
+            "未指定时取默认优先级"
+        );
     }
 
     #[test]
@@ -472,5 +468,197 @@ mod tests {
     fn unknown_kind_preview_is_marked() {
         let s = build_preview("delete_everything", &json!({}));
         assert!(s.contains("未知写操作类型"));
+    }
+
+    #[sqlx::test]
+    #[ignore = "requires a local PostgreSQL DATABASE_URL with database creation privileges"]
+    async fn postgres_concurrent_confirm_and_reject(db: PgPool) {
+        use std::time::Duration;
+
+        let family_id = Uuid::new_v4();
+        let op = propose(
+            &db,
+            family_id,
+            Some(Uuid::new_v4()),
+            kind::CREATE_TASK,
+            json!({"title": "交物业费"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = op.operation_id;
+
+        // Pause the first confirmation at its task insert, while it holds the approval row lock.
+        let mut blocker = db.begin().await.unwrap();
+        sqlx::query("LOCK TABLE tasks IN SHARE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let first = confirm(&db, family_id, id);
+        tokio::pin!(first);
+        tokio::select! {
+            result = &mut first => panic!("confirmation finished while insert was blocked: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let insert_waiting: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks
+                         WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                           AND relation = 'tasks'::regclass AND mode = 'RowExclusiveLock' AND NOT granted)",
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+                    if insert_waiting {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("first confirmation did not reach its task insert"),
+        }
+
+        let (first, replay, rejected, released) = tokio::join!(
+            first,
+            confirm(&db, family_id, id),
+            reject(&db, family_id, id),
+            blocker.commit(),
+        );
+        released.unwrap();
+        let first = first.unwrap();
+        assert_eq!(first.status, status::CONFIRMED);
+        assert_eq!(first.family_id, family_id);
+        assert_eq!(first.member_id, op.member_id);
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(replay.unwrap()).unwrap()
+        );
+        assert!(rejected.unwrap_err().contains("status=confirmed"));
+
+        let task_id: Uuid = sqlx::query_scalar("SELECT id FROM tasks WHERE family_id = $1")
+            .bind(family_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.result,
+            Some(json!({"id": task_id, "title": "交物业费"}))
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE family_id = $1")
+            .bind(family_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    #[ignore = "requires a local PostgreSQL DATABASE_URL with database creation privileges"]
+    async fn postgres_confirmation_rolls_back_business_insert(db: PgPool) {
+        let family_id = Uuid::new_v4();
+        let op = propose(
+            &db,
+            family_id,
+            None,
+            kind::CREATE_EVENT,
+            json!({"title": "家长会", "start_time": "2026-11-20T10:00:00Z"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = op.operation_id;
+        sqlx::query("ALTER TABLE agent_write_ops ADD CONSTRAINT block_confirm CHECK (status <> 'confirmed')")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let err = confirm(&db, family_id, id).await.unwrap_err();
+        assert!(err.contains("block_confirm"), "{err}");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE family_id = $1")
+            .bind(family_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let pending = list_ops(&db, family_id, Some(status::PROPOSED), 1)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&pending[0]).unwrap(),
+            serde_json::to_value(op).unwrap()
+        );
+
+        sqlx::query("ALTER TABLE agent_write_ops DROP CONSTRAINT block_confirm")
+            .execute(&db)
+            .await
+            .unwrap();
+        let confirmed = confirm(&db, family_id, id).await.unwrap();
+        let event_id: Uuid = sqlx::query_scalar("SELECT id FROM events WHERE family_id = $1")
+            .bind(family_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            confirmed.result,
+            Some(json!({"id": event_id, "title": "家长会"}))
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "requires a local PostgreSQL DATABASE_URL with database creation privileges"]
+    async fn postgres_reject_respects_family_and_terminal_status(db: PgPool) {
+        let family_id = Uuid::new_v4();
+        let other_family = Uuid::new_v4();
+        let op = propose(
+            &db,
+            family_id,
+            None,
+            kind::CREATE_TASK,
+            json!({"title": "待办"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let id = op.operation_id;
+        let not_found = format!("write op not found: {id}");
+        assert_eq!(confirm(&db, other_family, id).await.unwrap_err(), not_found);
+        assert_eq!(reject(&db, other_family, id).await.unwrap_err(), not_found);
+
+        let rejected = reject(&db, family_id, id).await.unwrap();
+        assert_eq!(rejected.status, status::REJECTED);
+        let replay = reject(&db, family_id, id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(rejected).unwrap(),
+            serde_json::to_value(replay).unwrap()
+        );
+        assert_eq!(
+            confirm(&db, family_id, id).await.unwrap_err(),
+            "write op was already rejected"
+        );
+
+        let expired_id = propose(
+            &db,
+            family_id,
+            None,
+            kind::CREATE_TASK,
+            json!({"title": "过期"}),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation_id;
+        sqlx::query("UPDATE agent_write_ops SET created_at = $2 WHERE operation_id = $1")
+            .bind(expired_id)
+            .bind(Utc::now() - chrono::Duration::days(MAX_PROPOSAL_AGE_DAYS + 1))
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(confirm(&db, family_id, expired_id)
+            .await
+            .unwrap_err()
+            .contains("write op expired"));
+        assert!(reject(&db, family_id, expired_id)
+            .await
+            .unwrap_err()
+            .contains("status=expired"));
     }
 }

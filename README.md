@@ -80,12 +80,19 @@ Wiki 页面只有重建器能写。
 
 ### 开发
 
+以下命令从 `hamr-app` 仓库根目录运行：
+
 ```bash
 # 单元测试
-cargo test --bin hamr-app-server
+cargo test --manifest-path backend/Cargo.toml --locked --offline --all-targets
 
-# 端到端验证（真实 Postgres + 真实后端进程 + 假模型）
-bash scripts/e2e/run.sh
+# 端到端验证（真实 PostgreSQL + 真实后端进程 + 模拟模型，CI 运行）
+bash backend/scripts/e2e/run.sh
 ```
+
+端到端脚本使用临时数据库、设备身份和共享密钥，不读取 `~/.hamr`。
+它设置 `HAMR_APP_LOCAL_ONLY=true`，让后端只监听 `127.0.0.1` 且不启动 P2P。
+测试端口被占用时直接退出，不终止其他进程；可用 `PG_PORT`、`API_PORT` 和
+`MOCK_PORT` 覆盖端口。脚本只调用本次运行创建的模拟端点，不需要安装、启动或下载真实模型。
 
 场景包格式见 [`backend/skills/README.md`](backend/skills/README.md)。

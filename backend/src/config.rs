@@ -17,6 +17,7 @@ mod tests {
     fn clear_env() {
         for k in [
             "HAMR_DATA_DIR",
+            "HAMR_APP_LOCAL_ONLY",
             "HAMR_APP_AUTH_MODE",
             "HAMR_APP_SHARED_SECRET",
             "HAMR_APP_ALLOWED_ORIGINS",
@@ -44,6 +45,21 @@ mod tests {
         assert_eq!(cfg.auth_mode, AuthMode::Open);
         // 默认 CORS allowlist 至少包含前端默认端口
         assert!(cfg.allowed_origins.iter().any(|o| o == "http://localhost:3010"));
+    }
+
+    #[test]
+    fn local_only_is_opt_in_and_rejects_invalid_values() {
+        let _env = env_guard();
+        clear_env();
+        assert!(!Config::from_env().unwrap().local_only);
+        std::env::set_var("HAMR_APP_LOCAL_ONLY", "true");
+        assert!(Config::from_env().unwrap().local_only);
+        std::env::set_var("HAMR_APP_LOCAL_ONLY", "typo");
+        assert!(Config::from_env()
+            .unwrap_err()
+            .to_string()
+            .contains("HAMR_APP_LOCAL_ONLY"));
+        clear_env();
     }
 
     #[test]
@@ -132,6 +148,8 @@ pub enum AuthMode {
 pub struct Config {
     pub database_url: String,
     pub port: u16,
+    /// 本地隔离模式：HTTP 只监听回环地址，不启动 P2P。
+    pub local_only: bool,
     pub data_dir: String,
     pub auth_mode: AuthMode,
     pub shared_secret: Option<String>,
@@ -205,7 +223,14 @@ impl Config {
                 ]
             });
 
+        let local_only = match std::env::var("HAMR_APP_LOCAL_ONLY").as_deref() {
+            Ok("true" | "1") => true,
+            Ok("false" | "0") | Err(std::env::VarError::NotPresent) => false,
+            _ => anyhow::bail!("HAMR_APP_LOCAL_ONLY must be true/false or 1/0"),
+        };
+
         Ok(Self {
+            local_only,
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgresql://hamr:changeme@localhost:5432/hamr_app".to_string()),
             port: std::env::var("PORT")

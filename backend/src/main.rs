@@ -50,22 +50,21 @@ async fn main() -> anyhow::Result<()> {
     // ── 启动 P2P 节点 ─────────────────────────────────────────
     // 把 DB 池交给节点：入站 SyncMessage 走 handle_incoming_sync 真实落库
     // （sync_log 幂等去重 + last-write-wins 合并）
-    let state = match p2p::start_p2p_node(
-        &config.data_dir,
-        Some(state.db.clone()),
-        metrics.clone(),
-    )
-    .await
-    {
-        Ok(handle) => {
-            tracing::info!("P2P node started: peer_id={}", handle.peer_id);
-            // 节点成功启动：node_up=1。单设备模式保持 0。
-            metrics.set_node_up(true);
-            state.with_p2p(handle).with_metrics(metrics)
-        }
-        Err(e) => {
-            tracing::warn!("P2P node failed to start (single-device mode): {}", e);
-            state.with_metrics(metrics)
+    let state = if config.local_only {
+        tracing::info!("Local-only mode: P2P disabled");
+        state.with_metrics(metrics)
+    } else {
+        match p2p::start_p2p_node(&config.data_dir, Some(state.db.clone()), metrics.clone()).await {
+            Ok(handle) => {
+                tracing::info!("P2P node started: peer_id={}", handle.peer_id);
+                // 节点成功启动：node_up=1。单设备模式保持 0。
+                metrics.set_node_up(true);
+                state.with_p2p(handle).with_metrics(metrics)
+            }
+            Err(e) => {
+                tracing::warn!("P2P node failed to start (single-device mode): {}", e);
+                state.with_metrics(metrics)
+            }
         }
     };
 
@@ -104,7 +103,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(cors);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let ip = if config.local_only { [127, 0, 0, 1] } else { [0, 0, 0, 0] };
+    let addr = SocketAddr::from((ip, config.port));
     tracing::info!("HamR App Server (P2P Local) listening on {}", addr);
     tracing::info!("API: http://{}/api/v1/health", addr);
     tracing::info!("P2P peers: http://{}/api/v1/p2p/peers", addr);

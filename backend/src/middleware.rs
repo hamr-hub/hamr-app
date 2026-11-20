@@ -195,15 +195,14 @@ mod tests {
     use base64::Engine as _;
 
     fn make_request(pk_b64: &str, ts: &str, sig_b64: &str) -> Request {
-        let req = axum::http::Request::builder()
+        axum::http::Request::builder()
             .method("GET")
             .uri("/api/v1/dashboard?family_id=00000000-0000-0000-0000-000000000000")
             .header("x-did-public-key", pk_b64)
             .header("x-did-timestamp", ts)
             .header("x-did-signature", sig_b64)
             .body(axum::body::Body::empty())
-            .unwrap();
-        req
+            .unwrap()
     }
 
     #[test]

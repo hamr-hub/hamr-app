@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
@@ -9,11 +10,12 @@ import SpacesPage from './pages/Spaces'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem('access_token')
-  if (!token) {
-    window.location.href = import.meta.env.VITE_ACCOUNT_URL || 'http://localhost:3000/login'
-    return null
-  }
-  return <>{children}</>
+  useEffect(() => {
+    if (!token) {
+      window.location.assign(import.meta.env.VITE_ACCOUNT_URL || 'http://localhost:3000/login')
+    }
+  }, [token])
+  return token ? <>{children}</> : null
 }
 
 export default function App() {

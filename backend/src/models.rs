@@ -224,24 +224,6 @@ pub struct DashboardStats {
     pub spaces_count: i64,
 }
 
-// ===== Pagination =====
-#[derive(Debug, Deserialize)]
-pub struct Pagination {
-    pub page: Option<i64>,
-    pub limit: Option<i64>,
-}
-
-impl Pagination {
-    pub fn offset(&self) -> i64 {
-        let p = self.page.unwrap_or(1).max(1);
-        let l = self.limit();
-        (p - 1) * l
-    }
-    pub fn limit(&self) -> i64 {
-        self.limit.unwrap_or(20).min(100).max(1)
-    }
-}
-
 // ===== Agent 运行时 =====
 
 /// Agent 会话

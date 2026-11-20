@@ -112,7 +112,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   createPerson: async (data) => {
-    const { familyId } = get(); if (!familyId) return
+    const { familyId } = get()
+    if (!familyId) throw new Error('A family is required to create a person')
     const { data: row } = await api.post<Person>('/people', { ...data, family_id: familyId })
     set((s) => ({ people: [...s.people, row] }))
   },

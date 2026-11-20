@@ -74,10 +74,8 @@ pub fn build_router(state: AppState) -> Router {
             auth_middleware,
         ));
 
-    // Agent 运行时路由：管家对话 + 会话/记忆管理。
-    //
-    // 与业务数据路由同级鉴权 —— Agent 能读到的家庭数据不比直接调 API 少，
-    // 鉴权级别必须一致。Agent 未启用时 handler 返回 503。
+    // Agent 路由先用与业务数据相同的鉴权，再检查运行时是否已初始化。
+    // 运行时不可用时整个子路由返回 503，包括用于就绪检查的 /status。
     let agent_routes = Router::new()
         .route("/api/v1/agent/chat", post(agent::chat))
         .route("/api/v1/agent/status", get(agent::status))
@@ -123,6 +121,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/agent/probe", post(agent::probe))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            agent::require_runtime,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             auth_middleware,
         ));
 
@@ -155,11 +157,36 @@ mod tests {
     //! （这里塞 None → "P2P node not running"），全程不打 DB。
 
     use super::*;
+    use crate::agent::{provider::StubProvider, store::MemStore, AgentRuntime};
     use crate::config::{AuthMode, Config};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
     use tower::util::ServiceExt;
+
+    const FAMILY_ID: &str = "00000000-0000-0000-0000-000000000001";
+    const OPERATION_ID: &str = "00000000-0000-0000-0000-000000000002";
+
+    fn authenticated_request(method: &str, uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer s3cret")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    fn start_test_runtime(state: &mut AppState) {
+        state.config.agent.enabled = true;
+        state.agent = Some(Arc::new(AgentRuntime::new(
+            state.config.agent.clone(),
+            Arc::new(StubProvider::new(Vec::new())),
+            Arc::new(MemStore::new()),
+            state.db.clone(),
+        )));
+    }
 
     /// 测试用 AppState：shared-secret 模式 + 一个固定 secret
     fn test_state(secret: &str) -> AppState {
@@ -170,6 +197,7 @@ mod tests {
         let config = Config {
             database_url: "postgresql://hamr:hamr@127.0.0.1:1/hamr_app".to_string(),
             port: 3002,
+            local_only: false,
             data_dir: "/tmp/hamr-routes-test".to_string(),
             auth_mode: AuthMode::SharedSecret,
             shared_secret: Some(secret.to_string()),
@@ -294,26 +322,109 @@ mod tests {
         );
     }
 
-    /// Agent 未启用时返回 503，而不是伪装成「助手不可用」的 500。
     #[tokio::test]
-    async fn agent_chat_returns_503_when_disabled() {
-        let app = build_router(test_state("s3cret"));
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/agent/chat")
-            .header("content-type", "application/json")
-            .header("authorization", "Bearer s3cret")
-            .body(Body::from(
-                r#"{"family_id":"00000000-0000-0000-0000-000000000001","message":"hi"}"#,
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Agent 未启用应返回 503"
+    async fn agent_routes_return_503_when_disabled() {
+        let state = test_state("s3cret");
+        state.db.close().await;
+        let app = build_router(state);
+        let family_query = format!("family_id={FAMILY_ID}");
+        let family_body = format!(r#"{{"family_id":"{FAMILY_ID}"}}"#);
+        let chat_body = format!(r#"{{"family_id":"{FAMILY_ID}","message":"hi"}}"#);
+        let skill_body = format!(
+            r#"{{"family_id":"{FAMILY_ID}","skill_id":"sample","version":"1.0.0","enabled":true}}"#
         );
+        for (method, path, body) in [
+            ("GET", "status".into(), ""),
+            ("POST", "chat".into(), chat_body.as_str()),
+            ("GET", format!("wiki?{family_query}"), ""),
+            ("POST", "wiki/rebuild".into(), family_body.as_str()),
+            ("GET", format!("skills?{family_query}"), ""),
+            ("GET", "skills/available".into(), ""),
+            ("POST", "skills/install".into(), skill_body.as_str()),
+            ("POST", "skills/enabled".into(), skill_body.as_str()),
+            ("GET", format!("write-ops?{family_query}"), ""),
+            (
+                "POST",
+                format!("write-ops/{OPERATION_ID}/confirm"),
+                family_body.as_str(),
+            ),
+            (
+                "POST",
+                format!("write-ops/{OPERATION_ID}/reject"),
+                family_body.as_str(),
+            ),
+        ] {
+            let uri = format!("/api/v1/agent/{path}");
+            let req = authenticated_request(method, &uri, Body::from(body.to_owned()));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_status_reports_readiness_of_initialized_runtime() {
+        let mut state = test_state("s3cret");
+        state.config.agent.enabled = true;
+        let status_request = || authenticated_request("GET", "/api/v1/agent/status", Body::empty());
+        let resp = build_router(state.clone())
+            .oneshot(status_request())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        start_test_runtime(&mut state);
+        let resp = build_router(state).oneshot(status_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["provider"], "local");
+        assert_eq!(json["model"], "stub");
+    }
+
+    #[tokio::test]
+    async fn disabled_agent_leaves_business_routes_available() {
+        let app = build_router(test_state("s3cret"));
+        // 业务 handler 先校验 family_id，此请求无需连接数据库。
+        let req = authenticated_request("GET", "/api/v1/people", Body::empty());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "family_id required");
+    }
+
+    #[tokio::test]
+    async fn agent_confirmation_checks_write_flag_before_store_access() {
+        for (allow_write, action, expected_status) in [
+            (false, "confirm", StatusCode::FORBIDDEN),
+            (true, "confirm", StatusCode::UNPROCESSABLE_ENTITY),
+            (false, "reject", StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let mut state = test_state("s3cret");
+            // 访问审批存储时，关闭的连接池立即报错，无需运行数据库。
+            state.db.close().await;
+            state.config.agent.allow_write = allow_write;
+            start_test_runtime(&mut state);
+            let uri = format!("/api/v1/agent/write-ops/{OPERATION_ID}/{action}");
+            let body = Body::from(format!(r#"{{"family_id":"{FAMILY_ID}"}}"#));
+            let req = authenticated_request("POST", &uri, body);
+            let resp = build_router(state).oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                expected_status,
+                "{action} with allow_write={allow_write}"
+            );
+            if expected_status == StatusCode::UNPROCESSABLE_ENTITY {
+                let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert!(json["error"].as_str().unwrap().contains("closed pool"));
+            }
+        }
     }
 
     /// Agent 的会话 / 记忆端点同样在鉴权之后。
@@ -322,7 +433,7 @@ mod tests {
         let app = build_router(test_state("s3cret"));
 
         let req = Request::builder()
-            .uri("/api/v1/agent/sessions?family_id=00000000-0000-0000-0000-000000000001")
+            .uri(format!("/api/v1/agent/sessions?family_id={FAMILY_ID}"))
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
