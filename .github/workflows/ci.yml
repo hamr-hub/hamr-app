@@ -40,7 +40,10 @@ jobs:
   rust:
     name: Rust (cargo check / test / clippy)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 分钟不够跑完整链路：fetch + check + test + 端到端（真实 Postgres 与
+    # 模拟模型）+ clippy，依赖编译时间占了大部分。留足余量，避免慢机器上
+    # 在最后一步被超时砍掉。
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4

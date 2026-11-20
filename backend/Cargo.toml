@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 数据库（PostgreSQL — 与 docker-compose.yml + migrations/*.sql 保持一致）
 # json: P2P sync 的 payload 以 jsonb 绑定进 jsonb_populate_record
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
 
 # UUID 和时间
 uuid = { version = "1.0", features = ["v4", "serde"] }
