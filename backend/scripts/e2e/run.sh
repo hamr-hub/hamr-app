@@ -26,12 +26,36 @@ fail() { printf '  \033[31m✗\033[0m %s\n' "$1"; FAILED=$((FAILED+1)); }
 step() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 cleanup() {
-  [[ -n "${BACKEND_PID:-}" ]] && kill "$BACKEND_PID" 2>/dev/null
-  [[ -n "${MOCK_PID:-}" ]] && kill "$MOCK_PID" 2>/dev/null
+  # 显式 wait 掉被杀掉的子进程 —— 否则 bash 退出时会打印 "Terminated: 15"
+  # 的作业控制噪声，混淆测试结果。
+  if [[ -n "${BACKEND_PID:-}" ]]; then
+    kill "$BACKEND_PID" 2>/dev/null
+    wait "$BACKEND_PID" 2>/dev/null
+  fi
+  if [[ -n "${MOCK_PID:-}" ]]; then
+    kill "$MOCK_PID" 2>/dev/null
+    wait "$MOCK_PID" 2>/dev/null
+  fi
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1
-  wait 2>/dev/null
 }
 trap cleanup EXIT
+
+# 上一轮残留的进程会继续监听端口，导致本轮后端绑定失败，
+# 而健康检查却打到旧进程上 —— 表现为"表不存在"的诡异 500。
+# 开跑前先把端口清干净。
+free_port() {
+  local port="$1" pids
+  pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    kill $pids 2>/dev/null || true
+    sleep 1
+    pids=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)
+    [[ -n "$pids" ]] && kill -9 $pids 2>/dev/null || true
+    sleep 1
+  fi
+}
+free_port "$API_PORT"
+free_port "$MOCK_PORT"
 
 # ---------- 起依赖 ----------
 step "启动依赖"
@@ -61,17 +85,19 @@ step "编译后端"
 step "启动后端"
 (
   cd "$BACKEND"
-  DATABASE_URL="$DB_URL" \
-  PORT="$API_PORT" \
-  HAMR_AGENT_ENABLED=true \
-  HAMR_AGENT_PROVIDER=local \
-  HAMR_AGENT_BASE_URL="http://127.0.0.1:${MOCK_PORT}/v1" \
-  HAMR_AGENT_MODEL=mock \
-  HAMR_AGENT_SKILLS_DIR="$BACKEND/skills" \
-  HAMR_AGENT_ALLOW_WRITE=true \
-  HAMR_AGENT_MAX_STEPS=6 \
-  RUST_LOG=warn \
-  ./target/debug/hamr-app-server
+  export DATABASE_URL="$DB_URL"
+  export PORT="$API_PORT"
+  export HAMR_AGENT_ENABLED=true
+  export HAMR_AGENT_PROVIDER=local
+  export HAMR_AGENT_BASE_URL="http://127.0.0.1:${MOCK_PORT}/v1"
+  export HAMR_AGENT_MODEL=mock
+  export HAMR_AGENT_SKILLS_DIR="$BACKEND/skills"
+  export HAMR_AGENT_ALLOW_WRITE=true
+  export HAMR_AGENT_MAX_STEPS=6
+  export RUST_LOG=warn
+  # exec 让子 shell 被服务端进程替换，$! 才是真正的服务端 PID，
+  # 否则 cleanup 杀掉的是 shell，服务端会变成残留进程继续占用端口。
+  exec ./target/debug/hamr-app-server
 ) >/tmp/hamr-e2e-server.log 2>&1 &
 BACKEND_PID=$!
 
@@ -79,6 +105,17 @@ for _ in $(seq 1 60); do
   if curl -fsS "${API}/api/v1/health" >/dev/null 2>&1; then break; fi
   sleep 1
 done
+# 必须确认本轮的服务端活着、且没有绑定端口失败 —— 否则健康检查会打到
+# 别人的旧进程上，后续断言会以"表不存在"的方式诡异地挂掉。
+if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+  fail "后端进程已退出（见 /tmp/hamr-e2e-server.log）"
+  tail -40 /tmp/hamr-e2e-server.log
+  exit 1
+fi
+if grep -q "Address already in use" /tmp/hamr-e2e-server.log; then
+  fail "后端端口被占用（见 /tmp/hamr-e2e-server.log）"
+  exit 1
+fi
 curl -fsS "${API}/api/v1/health" >/dev/null 2>&1 \
   && pass "后端就绪 (${API_PORT})" \
   || { fail "后端未就绪（见 /tmp/hamr-e2e-server.log）"; tail -40 /tmp/hamr-e2e-server.log; exit 1; }
@@ -86,13 +123,17 @@ curl -fsS "${API}/api/v1/health" >/dev/null 2>&1 \
 # ---------- 造数据 ----------
 step "造家庭数据"
 curl -fsS -X POST "${API}/api/v1/people" -H 'Content-Type: application/json' \
-  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"张伟\",\"role\":\"爸爸\"}" >/dev/null && pass "成员 张伟"
+  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"张伟\",\"role\":\"爸爸\"}" >/dev/null \
+  && pass "成员 张伟" || fail "创建成员 张伟 失败"
 curl -fsS -X POST "${API}/api/v1/people" -H 'Content-Type: application/json' \
-  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"李娜\",\"role\":\"妈妈\"}" >/dev/null && pass "成员 李娜"
+  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"李娜\",\"role\":\"妈妈\"}" >/dev/null \
+  && pass "成员 李娜" || fail "创建成员 李娜 失败"
 curl -fsS -X POST "${API}/api/v1/things" -H 'Content-Type: application/json' \
-  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"牛奶\",\"category\":\"食品\"}" >/dev/null && pass "物品 牛奶"
+  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"牛奶\",\"category\":\"食品\"}" >/dev/null \
+  && pass "物品 牛奶" || fail "创建物品 牛奶 失败"
 curl -fsS -X POST "${API}/api/v1/spaces" -H 'Content-Type: application/json' \
-  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"厨房\",\"type\":\"房间\"}" >/dev/null && pass "空间 厨房"
+  -d "{\"family_id\":\"${FAMILY}\",\"name\":\"厨房\",\"type\":\"房间\"}" >/dev/null \
+  && pass "空间 厨房" || fail "创建空间 厨房 失败"
 
 # ---------- 1. 家庭 Wiki ----------
 step "1. 家庭 Wiki（确定性重建 + 两段式检索）"
